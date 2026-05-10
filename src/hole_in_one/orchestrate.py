@@ -19,6 +19,7 @@ from hole_in_one.clod_api import (
     clod_second_validator,
     compress_greptile_feedback_for_fix,
     plan_builder_tasks,
+    plan_pr_workstreams,
 )
 from hole_in_one.dashboard_api import DashboardApiRuntime, start_dashboard_api_server
 from hole_in_one.dashboard_store import DashboardStore
@@ -290,6 +291,221 @@ def _wait_greptile(
         timed_out=True,
         clean_success_no_text=False,
     )
+
+
+def _normalize_workstreams(items: list[str], *, max_items: int) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in items:
+        text = re.sub(r"\s+", " ", raw).strip(" -\t\r\n")
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _heuristic_workstream_plan(task_prompt: str, *, max_items: int) -> list[str]:
+    cleaned = re.sub(r"\s+", " ", task_prompt).strip()
+    if len(cleaned) > 220:
+        cleaned = cleaned[:220].rstrip() + "…"
+    candidates = [
+        (
+            f"Implement core logic and data flow for: {cleaned}. Keep the scope in backend/core "
+            "modules and add focused tests when available."
+        ),
+        (
+            f"Integrate UI/API wiring for: {cleaned}. Reuse existing interfaces and keep contracts "
+            "compatible with the core logic changes."
+        ),
+        (
+            f"Harden and document: {cleaned}. Run lint/tests where available, fix edge-case regressions, "
+            "and update README or usage docs."
+        ),
+    ]
+    return _normalize_workstreams(candidates, max_items=max_items)
+
+
+def _plan_subagent_workstreams(
+    task_prompt: str,
+    *,
+    max_items: int,
+    clod_key: str,
+    clod_base_url: str,
+    clod_model: str,
+    clod_timeout_s: float,
+    clod_max_completion_tokens: int,
+    use_clod: bool,
+) -> list[str]:
+    if max_items <= 0:
+        return []
+
+    if use_clod and clod_key:
+        try:
+            planned = plan_pr_workstreams(
+                task_prompt,
+                api_key=clod_key,
+                base_url=clod_base_url,
+                model=clod_model,
+                max_workstreams=max_items,
+                timeout_s=clod_timeout_s,
+                max_completion_tokens=clod_max_completion_tokens,
+            )
+            normalized = _normalize_workstreams(planned, max_items=max_items)
+            if len(normalized) >= 2:
+                return normalized
+            print(
+                "CLōD workstream planner returned fewer than 2 items; using heuristic fallback.",
+                file=sys.stderr,
+            )
+        except Exception as exc:
+            print(
+                f"Warning: CLōD workstream planner failed ({exc}); using heuristic fallback.",
+                file=sys.stderr,
+            )
+
+    return _heuristic_workstream_plan(task_prompt, max_items=max_items)
+
+
+def _run_workstream_subagents(
+    api_key: str,
+    *,
+    parent_agent_id: str,
+    pr_url: str,
+    pull_number: int,
+    pr_head_ref: str | None,
+    workstreams: list[str],
+    max_workers: int,
+    model_id: str | None,
+    stop_mode: str,
+    dashboard: DashboardStore | None = None,
+) -> None:
+    total = len(workstreams)
+    if total <= 0:
+        return
+
+    def _mark_started(agent_id: str, idx: int, item: str) -> None:
+        if dashboard is None:
+            return
+        attached = dashboard.add_or_update_child_agent(
+            parent_id=parent_agent_id,
+            agent_id=agent_id,
+            role=f"workstream-{idx + 1}",
+            task=item,
+            kind=AgentKind.IMPLEMENTATION,
+            status=AgentStatus.RUNNING,
+            progress=8,
+        )
+        if not attached:
+            dashboard.add_or_update_root_agent(
+                agent_id=agent_id,
+                role=f"workstream-{idx + 1}",
+                task=item,
+                kind=AgentKind.IMPLEMENTATION,
+                status=AgentStatus.RUNNING,
+                progress=8,
+            )
+        dashboard.record_activity(
+            "impl",
+            f"{agent_id} started workstream {idx + 1}/{total} on PR #{pull_number}",
+        )
+
+    def _mark_finished(agent_id: str, idx: int, *, success: bool, note: str) -> None:
+        if dashboard is None:
+            return
+        attached = dashboard.finish_child_agent(
+            parent_id=parent_agent_id,
+            agent_id=agent_id,
+            success=success,
+            note=note,
+        )
+        if not attached:
+            dashboard.finish_agent(
+                agent_id,
+                success=success,
+                note=note,
+            )
+        dashboard.record_activity(
+            "impl",
+            f"{agent_id} {'completed' if success else 'failed'} workstream {idx + 1}/{total}",
+        )
+
+    def one(idx: int, workstream_task: str) -> None:
+        prompt = "\n".join(
+            [
+                f"You are subagent {idx + 1}/{total} on PR #{pull_number} ({pr_url}).",
+                "Only execute your assigned workstream; avoid unrelated refactors.",
+                "Push commits to the existing PR branch; do not open another PR.",
+                "Leave clear commit messages describing the slice you changed.",
+                "",
+                "Assigned workstream:",
+                workstream_task,
+            ]
+        )
+        created = create_agent_on_pr(
+            api_key,
+            prompt_text=prompt,
+            pr_url=pr_url,
+            auto_create_pr=False,
+            auto_generate_branch=False,
+            model_id=model_id,
+            pr_head_ref=pr_head_ref,
+        )
+        agent_id = created["agent"]["id"]
+        run_id = created["run"]["id"]
+        print(f"Workstream subagent ({idx + 1}/{total}): {agent_id}")
+        _mark_started(agent_id, idx, workstream_task)
+
+        try:
+            run = wait_for_terminal_run(api_key, agent_id, run_id)
+            if str(run.get("status") or "") != "FINISHED":
+                _mark_finished(
+                    agent_id,
+                    idx,
+                    success=False,
+                    note=f"{agent_id} failed workstream {idx + 1}/{total}",
+                )
+                raise RuntimeError(
+                    f"Workstream {idx + 1}/{total} failed for agent {agent_id}: {run}",
+                )
+            _mark_finished(
+                agent_id,
+                idx,
+                success=True,
+                note=f"{agent_id} completed workstream {idx + 1}/{total}",
+            )
+        finally:
+            try:
+                stop_agent(api_key, agent_id, stop_mode)
+                print(f"Stopped workstream subagent ({stop_mode}): {agent_id}")
+            except Exception as exc:
+                print(
+                    f"Warning: could not stop workstream subagent {agent_id}: {exc}",
+                    file=sys.stderr,
+                )
+
+    if max_workers <= 1 or total <= 1:
+        for i, item in enumerate(workstreams):
+            one(i, item)
+        return
+
+    errors: list[BaseException] = []
+    with ThreadPoolExecutor(max_workers=min(max_workers, total)) as ex:
+        futures = [ex.submit(one, i, item) for i, item in enumerate(workstreams)]
+        for fut in as_completed(futures):
+            try:
+                fut.result()
+            except BaseException as exc:
+                errors.append(exc)
+    if errors:
+        raise RuntimeError(
+            f"{len(errors)} workstream subagent(s) failed; first error: {errors[0]}",
+        )
 
 
 def _run_single_fix_agent(
@@ -614,6 +830,26 @@ def main() -> None:
     _compress_raw = os.environ.get("CLOD_COMPRESS_FOR_FIX", "1").strip().lower()
     clod_compress_for_fix = _compress_raw not in ("0", "false", "no")
 
+    workstream_subagents_enabled = os.environ.get(
+        "WORKSTREAM_SUBAGENTS_ENABLED",
+        "1",
+    ).strip().lower() not in ("0", "false", "no")
+    max_workstream_subagents = (
+        min(8, max(1, int(os.environ.get("MAX_WORKSTREAM_SUBAGENTS", "3"))))
+        if workstream_subagents_enabled
+        else 0
+    )
+    max_parallel_workstreams = min(5, max(1, int(os.environ.get("MAX_PARALLEL_WORKSTREAMS", "2"))))
+    workstream_subagents_strict = _env_truthy("WORKSTREAM_SUBAGENTS_STRICT")
+    workstream_use_clod_planner = os.environ.get(
+        "CLOD_WORKSTREAM_PLANNER",
+        "1",
+    ).strip().lower() not in ("0", "false", "no")
+    workstream_clod_timeout_s = float(os.environ.get("CLOD_WORKSTREAM_TIMEOUT_S", "90"))
+    workstream_clod_max_completion_tokens = int(
+        os.environ.get("CLOD_WORKSTREAM_MAX_COMPLETION_TOKENS", "1536"),
+    )
+
     clod_cfg: ClodCompressConfig | None = None
     if clod_key and clod_compress_for_fix:
         clod_cfg = ClodCompressConfig(
@@ -707,6 +943,18 @@ def main() -> None:
             extra_banner.append("clod-pr-comment")
     if planner_enabled:
         extra_banner.append("clod-planner")
+    if workstream_subagents_enabled and max_workstream_subagents > 0:
+        extra_banner.append(
+            f"workstreams={max_workstream_subagents} (parallel={max_parallel_workstreams})",
+        )
+        if workstream_use_clod_planner and clod_key:
+            extra_banner.append("workstream-planner=clod")
+        else:
+            extra_banner.append("workstream-planner=heuristic")
+        if workstream_subagents_strict:
+            extra_banner.append("workstream-strict")
+    else:
+        extra_banner.append("workstreams=off")
 
     dashboard_store: DashboardStore | None = None
     dashboard_api: DashboardApiRuntime | None = None
@@ -958,6 +1206,65 @@ def main() -> None:
         
                     assert pr_url is not None and pull_number is not None
                     _, pr_head_ref_for_fix = get_pr_head(gh, repo, pull_number)
+
+                    if workstream_subagents_enabled and max_workstream_subagents > 0:
+                        workstreams = _plan_subagent_workstreams(
+                            builder_prompt,
+                            max_items=max_workstream_subagents,
+                            clod_key=clod_key,
+                            clod_base_url=clod_shared_base,
+                            clod_model=clod_shared_model,
+                            clod_timeout_s=workstream_clod_timeout_s,
+                            clod_max_completion_tokens=workstream_clod_max_completion_tokens,
+                            use_clod=workstream_use_clod_planner,
+                        )
+                        if workstreams:
+                            print(
+                                f"Planned {len(workstreams)} workstream subagent task(s) for PR #{pull_number}:",
+                            )
+                            for i, ws in enumerate(workstreams):
+                                print(f"  {i + 1}. {ws}")
+                            if dashboard_store is not None:
+                                dashboard_store.record_activity(
+                                    "plan",
+                                    f"{len(workstreams)} workstreams for PR #{pull_number}",
+                                )
+                            try:
+                                _run_workstream_subagents(
+                                    api_key,
+                                    parent_agent_id=builder_id,
+                                    pr_url=pr_url,
+                                    pull_number=pull_number,
+                                    pr_head_ref=pr_head_ref_for_fix,
+                                    workstreams=workstreams,
+                                    max_workers=max_parallel_workstreams,
+                                    model_id=model_id,
+                                    stop_mode=stop_mode,
+                                    dashboard=dashboard_store,
+                                )
+                                _, pr_head_ref_for_fix = get_pr_head(gh, repo, pull_number)
+                                print(
+                                    f"Finished workstream subagents for PR #{pull_number}.",
+                                )
+                                if dashboard_store is not None:
+                                    dashboard_store.record_activity(
+                                        "plan",
+                                        f"completed workstreams for PR #{pull_number}",
+                                    )
+                            except Exception as exc:
+                                print(
+                                    f"Warning: workstream subagents failed on PR #{pull_number}: {exc}",
+                                    file=sys.stderr,
+                                )
+                                if dashboard_store is not None:
+                                    dashboard_store.record_activity(
+                                        "failed",
+                                        f"workstream subagents failed on PR #{pull_number}",
+                                    )
+                                if workstream_subagents_strict:
+                                    if continuous:
+                                        break
+                                    raise SystemExit(2) from exc
         
                     graphql_auto_merge_enabled = False
                     graphql_auto_merge_failed = False

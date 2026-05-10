@@ -142,6 +142,73 @@ class DashboardStore:
             if note:
                 self._activity.append(f"{time.strftime('%H:%M:%S')}  complete   {note}")
 
+    def add_or_update_child_agent(
+        self,
+        *,
+        parent_id: str,
+        agent_id: str,
+        role: str,
+        task: str,
+        kind: AgentKind,
+        status: AgentStatus,
+        progress: int,
+    ) -> bool:
+        with self._lock:
+            parent = self._find_node(self._in_progress, parent_id) or self._find_node(
+                self._completed,
+                parent_id,
+            )
+            if parent is None:
+                return False
+
+            child = self._find_node(parent.children, agent_id)
+            if child is not None:
+                child.role = role
+                child.task = task
+                child.kind = kind
+                child.status = status
+                child.progress = max(0, min(100, progress))
+                return True
+
+            parent.children.append(
+                AgentNode(
+                    id=agent_id,
+                    role=role,
+                    task=task,
+                    kind=kind,
+                    status=status,
+                    progress=max(0, min(100, progress)),
+                )
+            )
+            return True
+
+    def finish_child_agent(
+        self,
+        *,
+        parent_id: str,
+        agent_id: str,
+        success: bool,
+        note: str | None = None,
+    ) -> bool:
+        with self._lock:
+            parent = self._find_node(self._in_progress, parent_id) or self._find_node(
+                self._completed,
+                parent_id,
+            )
+            if parent is None:
+                return False
+
+            child = self._find_node(parent.children, agent_id)
+            if child is None:
+                return False
+
+            child.status = AgentStatus.COMPLETE if success else AgentStatus.FAILED
+            child.progress = 100 if success else max(1, child.progress)
+
+            if note:
+                self._activity.append(f"{time.strftime('%H:%M:%S')}  complete   {note}")
+            return True
+
     def mark_merge_queued(self, pull_number: int, method: str) -> None:
         self.record_activity("merge", f"queued auto-merge ({method}) for PR #{pull_number}")
 
@@ -174,6 +241,7 @@ class DashboardStore:
             done_count = sum(1 for n in all_nodes if n.status == AgentStatus.COMPLETE)
             failed_count = sum(1 for n in all_nodes if n.status == AgentStatus.FAILED)
             pending_count = sum(1 for n in all_nodes if n.status == AgentStatus.PENDING)
+            running_count = sum(1 for n in all_nodes if n.status == AgentStatus.RUNNING)
             implementation_agents = sum(1 for n in all_nodes if n.kind == AgentKind.IMPLEMENTATION)
             fix_agents = sum(1 for n in all_nodes if n.kind == AgentKind.FIX)
 
@@ -211,7 +279,7 @@ class DashboardStore:
             return DashboardSnapshot(
                 project_name=self._project_name,
                 uptime=uptime,
-                total_parallel_agents=len(in_progress),
+                total_parallel_agents=running_count,
                 commits_per_hour=commits_per_hour,
                 metrics=metrics,
                 merge_queue=merge_queue,
@@ -226,6 +294,15 @@ class DashboardStore:
         for idx, node in enumerate(roots):
             if node.id == agent_id:
                 return idx
+        return None
+
+    def _find_node(self, roots: list[AgentNode], agent_id: str) -> AgentNode | None:
+        stack = list(roots)
+        while stack:
+            node = stack.pop()
+            if node.id == agent_id:
+                return node
+            stack.extend(node.children)
         return None
 
     def _clone_node(self, node: AgentNode) -> AgentNode:

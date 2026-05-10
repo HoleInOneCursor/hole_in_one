@@ -9,7 +9,7 @@ This repo now has a frontend-first **web dashboard**:
 - Next.js app in `web/`
 - Tabs: `Agent Grid`, `Activity`, `Graph`
 - Graph is a browser-native animated node/edge visualization
-- Current web dashboard is intentionally mock-data driven (no backend wiring yet)
+- Supports both `mock` mode and `live` mode via FastAPI snapshot polling
 
 A legacy Textual terminal dashboard still exists in the Python package, but the web UI is now the primary frontend.
 
@@ -36,10 +36,11 @@ npm run dev
 
 1. A **builder** cloud agent opens a PR on `GITHUB_REPO` (`POST /v1/agents` with `autoCreatePR`).
 2. The builder is **stopped** (`CURSOR_STOP_AGENT`, default `archive`) once the PR is resolved.
-3. Greptile reviews the PR; this CLI polls GitHub for checks/comments.
-4. Each fix round starts a **new** cloud agent scoped to that PR (`repos[0].prUrl`), then stops it when the run finishes. Use `MAX_PARALLEL_FIXERS>1` only if you accept possible branch contention (cap is 5).
-5. **Continuous mode** (`CONTINUOUS_BUILDS=1` or `orchestrate --continuous`): after Greptile + fix rounds, wait until the PR **merges**, then start another builder on the same default branch so the repo keeps gaining small improvements.
-6. Exposes a FastAPI dashboard bridge at `GET /api/dashboard/snapshot` and `GET /api/dashboard/health` (default `http://127.0.0.1:8787`) so the Next.js dashboard can poll live orchestration state.
+3. Optional workstream decomposition breaks the builder task into smaller slices and spawns **implementation subagents** on that same PR branch (`WORKSTREAM_SUBAGENTS_ENABLED=1`).
+4. Greptile reviews the PR; this CLI polls GitHub for checks/comments.
+5. Each fix round starts a **new** cloud agent scoped to that PR (`repos[0].prUrl`), then stops it when the run finishes. Use `MAX_PARALLEL_FIXERS>1` only if you accept possible branch contention (cap is 5).
+6. **Continuous mode** (`CONTINUOUS_BUILDS=1` or `orchestrate --continuous`): after Greptile + fix rounds, wait until the PR **merges**, then start another builder on the same default branch so the repo keeps gaining small improvements.
+7. Exposes a FastAPI dashboard bridge at `GET /api/dashboard/snapshot` and `GET /api/dashboard/health` (default `http://127.0.0.1:8787`) so the Next.js dashboard can poll live orchestration state, including child subagents in tree/graph views.
 
 Set **`GITHUB_AUTO_MERGE=merge`** (or `squash` / `rebase`) so each new PR **queues GitHub auto-merge** as soon as the CLI knows the PR number (merging still waits on your checks and branch protection). On GitHub: **Settings → General → Pull Requests → Allow auto-merge**. The PAT needs **Pull requests: Read and write** (fine-grained). When queueing **succeeds**, **`GITHUB_MERGE_ON_GREPTILE_CLEAN`** is skipped for that PR so GitHub merges alone—no redundant REST merge. If GraphQL queueing **fails** (common with insufficient PAT scopes) but Greptile looks **clean**, the CLI **REST-merges** using the same **`GITHUB_AUTO_MERGE`** method (`squash` / `merge` / `rebase`) so **`CONTINUOUS_BUILDS`** is not stuck waiting. If you see “Resource not accessible by personal access token”, expand PAT permissions, authorize SSO, or use **`GITHUB_MERGE_IMMEDIATE`** / **`GITHUB_MERGE_ON_GREPTILE_CLEAN`** instead.
 
@@ -86,6 +87,7 @@ Optional **[CLōD](https://clod.io/)** ([API docs](https://clod.io/docs)): set *
 If **`GITHUB_DEFAULT_BRANCH`** is unset, the CLI loads the repo’s **GitHub default branch** via the API (not hard-coded `main`). **`CURSOR_STARTING_REF_REFS_FIRST`** / **`CURSOR_TRY_COMMIT_SHA_FOR_STARTING_REF`** retry Cursor `startingRef` when branch validation flakes.
 
 Tune `GREPTILE_BOT_SUBSTRINGS` / `GREPTILE_CHECK_SUBSTRINGS` if your Greptile app uses different logins or check titles.
+Tune `MAX_WORKSTREAM_SUBAGENTS` / `MAX_PARALLEL_WORKSTREAMS` to control how aggressively builder tasks are split into implementation subagents before Greptile runs.
 
 ## Layout
 

@@ -127,6 +127,75 @@ def plan_builder_tasks(
     return tasks if tasks else [g]
 
 
+def plan_pr_workstreams(
+    task_prompt: str,
+    *,
+    api_key: str,
+    base_url: str = DEFAULT_CLOD_BASE_URL,
+    model: str = DEFAULT_CLOD_MODEL,
+    max_workstreams: int = 4,
+    timeout_s: float = 90.0,
+    max_completion_tokens: int = 1536,
+) -> list[str]:
+    """
+    Split one builder task into independent workstreams for subagents on the same PR branch.
+    """
+    p = task_prompt.strip()
+    if not p:
+        return []
+
+    system = (
+        "You break one coding task into independent, parallelizable implementation workstreams.\n"
+        "Rules:\n"
+        "- Output only a JSON array of strings.\n"
+        "- Each item is a concise workstream instruction for a subagent working on the same PR branch.\n"
+        "- Do NOT tell subagents to open a new PR, create release notes, or repeat all tests in every item.\n"
+        "- Prefer file/module boundaries and minimal overlap to reduce merge conflicts.\n"
+        "- Return 2 to 4 workstreams when possible.\n"
+        f"- Return at most {max_workstreams} items."
+    )
+    user_msg = f"Task to decompose into workstreams:\n\n{p}"
+
+    raw = _chat_completion(
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_msg},
+        ],
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        timeout_s=timeout_s,
+        max_completion_tokens=max_completion_tokens,
+        temperature=0.2,
+    )
+
+    blob = raw.strip()
+    fence = re.match(r"^```(?:json)?\s*([\s\S]*?)\s*```\s*$", blob)
+    if fence:
+        blob = fence.group(1).strip()
+
+    try:
+        data = json.loads(blob)
+    except json.JSONDecodeError:
+        arr_match = re.search(r"\[[\s\S]*\]", blob)
+        if not arr_match:
+            raise RuntimeError(f"Workstream planner returned non-JSON: {blob[:400]}") from None
+        data = json.loads(arr_match.group(0))
+
+    if not isinstance(data, list):
+        raise RuntimeError("Workstream planner JSON must be an array of strings")
+
+    out: list[str] = []
+    for item in data[:max_workstreams]:
+        if isinstance(item, str) and item.strip():
+            out.append(item.strip())
+        elif isinstance(item, dict) and "task" in item:
+            t = str(item.get("task", "")).strip()
+            if t:
+                out.append(t)
+    return out
+
+
 def compress_greptile_feedback_for_fix(
     raw: str,
     *,
