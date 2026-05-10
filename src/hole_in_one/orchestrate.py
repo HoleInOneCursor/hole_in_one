@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import re
 import sys
 import time
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
@@ -11,6 +14,7 @@ import httpx
 from dotenv import load_dotenv
 
 from hole_in_one.cursor_api import (
+    CursorCloudError,
     create_agent,
     create_agent_on_pr,
     get_agent,
@@ -20,18 +24,66 @@ from hole_in_one.cursor_api import (
 from hole_in_one.feedback import split_feedback
 from hole_in_one.github_api import (
     Repo,
+    branch_exists,
     enable_pull_request_auto_merge,
+    find_latest_open_pr_head_ref_prefix,
     find_open_pr_for_branch,
+    get_branch_tip_sha,
+    get_default_branch,
     get_pr_head,
     github_client,
+    merge_pull_request_rest,
     parse_repo,
     poll_greptile_signal,
     pull_number_from_pr_url,
+    pull_request_merged,
     repo_https_url,
+    wait_pull_mergeable_clean,
     wait_pull_merged,
 )
 
 load_dotenv()
+
+DEFAULT_BUILDER_PROMPT = (
+    'Make a small, self-contained improvement that fits the theme "Build Something Agents Want"\n'
+    "(for example: a helper script, a concise doc, or a tiny devtool that makes agent workflows nicer).\n"
+    "Keep the change reviewable in under 15 minutes."
+)
+
+
+def _utc_iso_z() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _greptile_indicates_no_action_needed(text: str, *, extra_substrings: list[str]) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    lower = stripped.lower()
+    for s in extra_substrings:
+        if s and s.lower() in lower:
+            return True
+    if re.search(r"\bsafe\s+to\s+merge\b", stripped, re.I):
+        return True
+    if re.search(r"\bno\s+(critical\s+)?issues\s+(were\s+)?found\b", stripped, re.I):
+        return True
+    if "no files require special attention" in lower and re.search(r"\b5\s*/\s*5\b", stripped):
+        return True
+    return False
+
+
+def _branch_name_from_cursor_agent(agent: dict[str, object]) -> str | None:
+    v = agent.get("branchName")
+    if isinstance(v, str) and v.strip():
+        return v.strip()
+    repos = agent.get("repos")
+    if isinstance(repos, list):
+        for entry in repos:
+            if isinstance(entry, dict):
+                bn = entry.get("branchName")
+                if isinstance(bn, str) and bn.strip():
+                    return bn.strip()
+    return None
 
 
 def _env(name: str, default: str | None = None) -> str:
@@ -116,6 +168,7 @@ def _run_single_fix_agent(
     *,
     pr_url: str,
     pull_number: int,
+    pr_head_ref: str | None,
     feedback_text: str,
     model_id: str | None,
     stop_mode: str,
@@ -137,6 +190,7 @@ def _run_single_fix_agent(
         auto_create_pr=False,
         auto_generate_branch=False,
         model_id=model_id,
+        pr_head_ref=pr_head_ref,
     )
     fix_agent_id = created["agent"]["id"]
     run_id = created["run"]["id"]
@@ -155,6 +209,7 @@ def _parallel_fix_agents(
     *,
     pr_url: str,
     pull_number: int,
+    pr_head_ref: str | None,
     chunks: list[str],
     max_workers: int,
     model_id: str | None,
@@ -176,6 +231,7 @@ def _parallel_fix_agents(
             auto_create_pr=False,
             auto_generate_branch=False,
             model_id=model_id,
+            pr_head_ref=pr_head_ref,
         )
         agent_id = created["agent"]["id"]
         run_id = created["run"]["id"]
@@ -193,9 +249,68 @@ def _parallel_fix_agents(
     print("Parallel fix runs finished (inspect PR for conflicts).")
 
 
+def _rest_merge_when_mergeable(
+    gh: httpx.Client,
+    repo: Repo,
+    pull_number: int,
+    *,
+    merge_method: str,
+    merge_poll_budget_s: float,
+    merge_poll_interval_s: float,
+    env_label: str,
+) -> bool:
+    """REST-merge when GitHub reports mergeable. Returns False if merge failed or timed out."""
+    print(
+        f"{env_label}={merge_method}: polling until mergeable_state=clean "
+        "(or already merged), then REST merge…",
+    )
+    try:
+        merged_ok = wait_pull_mergeable_clean(
+            gh,
+            repo,
+            pull_number,
+            poll_interval_s=merge_poll_interval_s,
+            budget_s=merge_poll_budget_s,
+        )
+        if merged_ok:
+            if pull_request_merged(gh, repo, pull_number):
+                print("PR already merged.")
+                return True
+            try:
+                merge_pull_request_rest(gh, repo, pull_number, merge_method)
+                print("Merged PR via GitHub REST API.")
+                return True
+            except Exception as exc:
+                print(f"REST merge failed: {exc}", file=sys.stderr)
+                return False
+
+        print(
+            "PR did not become mergeable in time, or has conflicts / is blocked. "
+            "Fix checks, reviews, or conflicts and merge manually.",
+            file=sys.stderr,
+        )
+        return False
+    except KeyboardInterrupt:
+        print("\norchestrate: interrupted during REST merge wait.", file=sys.stderr)
+        raise SystemExit(130) from None
+
+
 def main() -> None:
     prs = argparse.ArgumentParser(
         description="Hole in One: Cursor builder + Greptile + optional fix rounds + continuous mode.",
+    )
+    mx = prs.add_mutually_exclusive_group()
+    mx.add_argument(
+        "-p",
+        "--prompt",
+        metavar="TEXT",
+        help="Instructions for the builder cloud agent (overrides BUILDER_PROMPT in .env)",
+    )
+    mx.add_argument(
+        "-i",
+        "--interactive-prompt",
+        action="store_true",
+        help="Prompt on the terminal for the builder task (overrides BUILDER_PROMPT)",
     )
     prs.add_argument(
         "--continuous",
@@ -204,18 +319,26 @@ def main() -> None:
     )
     args = prs.parse_args()
 
+    if args.interactive_prompt:
+        print("Task for the builder cloud agent (one line; Ctrl+C to cancel):")
+        try:
+            builder_prompt = input("> ").strip()
+        except EOFError:
+            raise SystemExit("No prompt entered.") from None
+        if not builder_prompt:
+            raise SystemExit("Empty prompt.")
+    elif args.prompt is not None:
+        builder_prompt = args.prompt.strip()
+        if not builder_prompt:
+            raise SystemExit("Empty --prompt.")
+    else:
+        builder_prompt = os.environ.get("BUILDER_PROMPT", DEFAULT_BUILDER_PROMPT)
+
     api_key = _env("CURSOR_API_KEY")
     gh_token = _env("GITHUB_TOKEN")
     repo_full = _env("GITHUB_REPO")
     repo = parse_repo(repo_full)
     repo_url = repo_https_url(repo)
-
-    builder_prompt = os.environ.get(
-        "BUILDER_PROMPT",
-        'Make a small, self-contained improvement that fits the theme "Build Something Agents Want"\n'
-        "(for example: a helper script, a concise doc, or a tiny devtool that makes agent workflows nicer).\n"
-        "Keep the change reviewable in under 15 minutes.",
-    )
 
     poll_interval_s = float(os.environ.get("GREPTILE_POLL_INTERVAL_S", "20"))
     poll_budget_s = float(os.environ.get("GREPTILE_POLL_BUDGET_S", "900"))
@@ -227,8 +350,19 @@ def main() -> None:
 
     bot_substrings = _comma_list("GREPTILE_BOT_SUBSTRINGS", "greptile")
     check_substrings = _comma_list("GREPTILE_CHECK_SUBSTRINGS", "greptile")
-    default_branch = os.environ.get("GITHUB_DEFAULT_BRANCH", "main")
+    greptile_clean_substrings = _comma_list("GREPTILE_CLEAN_SUBSTRINGS", "")
+    explicit_branch = os.environ.get("GITHUB_DEFAULT_BRANCH", "").strip()
     model_id = os.environ.get("CURSOR_MODEL") or None
+
+    refs_first = os.environ.get("CURSOR_STARTING_REF_REFS_FIRST", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    try_commit_sha = os.environ.get(
+        "CURSOR_TRY_COMMIT_SHA_FOR_STARTING_REF",
+        "",
+    ).strip().lower() in ("1", "true", "yes")
 
     continuous = args.continuous or os.environ.get("CONTINUOUS_BUILDS", "").strip().lower() in (
         "1",
@@ -246,33 +380,154 @@ def main() -> None:
             "GITHUB_AUTO_MERGE must be merge, squash, or rebase (or unset).",
         )
 
+    github_merge_immediate_raw = os.environ.get("GITHUB_MERGE_IMMEDIATE", "").strip().lower()
+    github_merge_immediate: str | None = github_merge_immediate_raw or None
+    if github_merge_immediate and github_merge_immediate not in ("merge", "squash", "rebase"):
+        raise SystemExit(
+            "GITHUB_MERGE_IMMEDIATE must be merge, squash, or rebase (or unset).",
+        )
+
+    github_merge_on_clean_raw = os.environ.get(
+        "GITHUB_MERGE_ON_GREPTILE_CLEAN",
+        "",
+    ).strip().lower()
+    github_merge_on_clean: str | None = github_merge_on_clean_raw or None
+    if github_merge_on_clean and github_merge_on_clean not in ("merge", "squash", "rebase"):
+        raise SystemExit(
+            "GITHUB_MERGE_ON_GREPTILE_CLEAN must be merge, squash, or rebase (or unset).",
+        )
+
+    merge_poll_budget_s = float(os.environ.get("GITHUB_MERGE_POLL_BUDGET_S", "7200"))
+    merge_poll_interval_s = float(os.environ.get("GITHUB_MERGE_POLL_INTERVAL_S", "15"))
+
+    queue_auto_merge = bool(github_auto_merge) and not github_merge_immediate
+    if github_auto_merge and github_merge_immediate:
+        print(
+            "Both GITHUB_AUTO_MERGE and GITHUB_MERGE_IMMEDIATE are set; "
+            "using immediate REST merge only (skipping GraphQL auto-merge).",
+            file=sys.stderr,
+        )
+
+    extra_banner = []
+    if queue_auto_merge:
+        extra_banner.append(f"auto-merge={github_auto_merge}")
+    if github_merge_immediate:
+        extra_banner.append(f"merge-immediate={github_merge_immediate}")
+    if github_merge_on_clean:
+        extra_banner.append(f"merge-on-greptile-clean={github_merge_on_clean}")
+
     print(
         f"Repo {repo_full} | new agent per Greptile fix | "
         f"max_parallel_fixers={max_parallel_fixers} | stop={stop_mode}"
         f" | continuous={continuous}"
-        f"{f' | auto-merge={github_auto_merge}' if github_auto_merge else ''}",
+        + (f" | {' | '.join(extra_banner)}" if extra_banner else ""),
     )
 
     full_builder_prompt = (
         builder_prompt + "\n\nOpen a normal (non-draft) PR with a clear title and description."
     )
 
+    def _starting_ref_retryable(exc: CursorCloudError) -> bool:
+        if not exc.body:
+            return False
+        b = exc.body.lower()
+        if exc.status_code == 400:
+            return (
+                "verify existence" in b
+                or "failed to verify" in b
+                or "does not exist in repository" in b
+            )
+        if exc.status_code == 404:
+            return (
+                "failed to fetch branch" in b
+                or "get-a-reference" in b
+                or ("failed to fetch" in b and "ref" in b)
+            )
+        return False
+
     with github_client(gh_token) as gh:
+        if explicit_branch:
+            if not branch_exists(gh, repo, explicit_branch):
+                actual = get_default_branch(gh, repo)
+                raise SystemExit(
+                    f"GITHUB_DEFAULT_BRANCH={explicit_branch!r} does not exist on {repo_full}. "
+                    f"GitHub default branch is {actual!r}. Update .env or remove GITHUB_DEFAULT_BRANCH "
+                    "to use the repo default automatically.",
+                )
+            default_branch = explicit_branch
+        else:
+            default_branch = get_default_branch(gh, repo)
+            print(f"Starting ref (GitHub default branch): {default_branch}")
+
+        if not branch_exists(gh, repo, default_branch):
+            raise SystemExit(
+                f"Branch {default_branch!r} has no commits on {repo_full} yet (or the ref does not exist). "
+                "Push at least one commit, or set GITHUB_DEFAULT_BRANCH to an existing branch.",
+            )
+
         cycle = 0
         while True:
             cycle += 1
             if continuous:
                 print(f"\n=== Continuous build cycle {cycle} ===")
 
-            created = create_agent(
-                api_key,
-                prompt_text=full_builder_prompt,
-                repo_url=repo_url,
-                starting_ref=default_branch,
-                auto_create_pr=True,
-                skip_reviewer_request=True,
-                model_id=model_id,
-            )
+            if continuous and cycle > 1 and not explicit_branch:
+                default_branch = get_default_branch(gh, repo)
+
+            refs_heads = f"refs/heads/{default_branch}"
+            pair = [("refs_heads", refs_heads), ("branch_name", default_branch)]
+            starting_attempts: list[tuple[str, str]] = pair if refs_first else [pair[1], pair[0]]
+            if refs_first and cycle == 1:
+                print(
+                    "CURSOR_STARTING_REF_REFS_FIRST=1 — trying refs/heads before plain branch name.",
+                )
+            if try_commit_sha:
+                starting_attempts.append(
+                    ("commit_sha", get_branch_tip_sha(gh, repo, default_branch)),
+                )
+
+            seen_refs: set[str] = set()
+            created: dict | None = None
+            last_exc: CursorCloudError | None = None
+            for label, start_ref in starting_attempts:
+                if start_ref in seen_refs:
+                    continue
+                seen_refs.add(start_ref)
+                preview = (
+                    f"{start_ref[:12]}…{start_ref[-6:]}" if len(start_ref) > 44 else start_ref
+                )
+                print(f"create_agent startingRef ({label}): {preview}")
+                try:
+                    created = create_agent(
+                        api_key,
+                        prompt_text=full_builder_prompt,
+                        repo_url=repo_url,
+                        starting_ref=start_ref,
+                        auto_create_pr=True,
+                        skip_reviewer_request=True,
+                        model_id=model_id,
+                    )
+                    break
+                except CursorCloudError as exc:
+                    last_exc = exc
+                    if not _starting_ref_retryable(exc):
+                        raise
+                    snippet = (exc.body or "")[:280].replace("\n", " ")
+                    print(
+                        f"  → Cursor rejected this startingRef; retrying. ({snippet})",
+                        file=sys.stderr,
+                    )
+
+            if created is None:
+                print(
+                    "\nAll startingRef attempts failed. "
+                    "If Cursor lists your repo under Integrations, contact Cursor support.\n",
+                    file=sys.stderr,
+                )
+                if last_exc:
+                    raise last_exc
+                raise RuntimeError("create_agent failed without exception")
+
             builder_id = created["agent"]["id"]
             run_id = created["run"]["id"]
             print(f"Builder agent: {builder_id}")
@@ -290,15 +545,42 @@ def main() -> None:
             pull_number: int | None = None
             try:
                 agent_meta = get_agent(api_key, builder_id)
-                branch_name = agent_meta.get("branchName")
+                branch_name = _branch_name_from_cursor_agent(agent_meta)
                 if not branch_name:
-                    print("Agent has no branchName after run; cannot resolve PR.", file=sys.stderr)
-                    sys.exit(2)
+                    for attempt in range(10):
+                        time.sleep(3.0)
+                        agent_meta = get_agent(api_key, builder_id)
+                        branch_name = _branch_name_from_cursor_agent(agent_meta)
+                        if branch_name:
+                            print(f"Resolved branchName from Cursor API (poll {attempt + 2}).")
+                            break
 
-                pr_data = find_open_pr_for_branch(gh, repo, branch_name)
+                pr_data = None
+                if branch_name:
+                    pr_data = find_open_pr_for_branch(gh, repo, branch_name)
+
+                if not pr_data:
+                    ref_prefix = os.environ.get("CURSOR_PR_HEAD_PREFIX", "cursor/").strip() or "cursor/"
+                    guess = find_latest_open_pr_head_ref_prefix(gh, repo, ref_prefix=ref_prefix)
+                    if guess:
+                        pr_data = guess
+                        head = guess.get("head") or {}
+                        branch_name = str(head.get("ref") or branch_name or "")
+                        print(
+                            "No usable branchName on agent; using newest open PR whose head ref starts with "
+                            f"{ref_prefix!r} → #{guess.get('number')} ({branch_name}). "
+                            "Confirm this is the builder PR if several exist.",
+                            file=sys.stderr,
+                        )
+
                 if not pr_data:
                     print(
-                        f"No open PR found for head {repo.owner}:{branch_name}. Open GitHub or widen search.",
+                        "Could not resolve builder PR: Cursor agent has no usable branchName "
+                        "and no matching open PR.",
+                        file=sys.stderr,
+                    )
+                    print(
+                        f"Agent JSON (truncated):\n{json.dumps(agent_meta, indent=2)[:3500]}",
                         file=sys.stderr,
                     )
                     sys.exit(2)
@@ -318,16 +600,44 @@ def main() -> None:
                     print(f"Warning: could not stop builder agent: {exc}", file=sys.stderr)
 
             assert pr_url is not None and pull_number is not None
+            _, pr_head_ref_for_fix = get_pr_head(gh, repo, pull_number)
 
-            if github_auto_merge:
+            graphql_auto_merge_enabled = False
+            graphql_auto_merge_failed = False
+            if queue_auto_merge and github_auto_merge:
                 try:
                     enable_pull_request_auto_merge(gh, repo, pull_number, github_auto_merge)
+                    graphql_auto_merge_enabled = True
                     print(
                         f"Queued GitHub auto-merge ({github_auto_merge}); "
                         "merges when required checks and branch rules pass.",
                     )
                 except Exception as exc:
+                    graphql_auto_merge_failed = True
                     print(f"Warning: could not enable auto-merge: {exc}", file=sys.stderr)
+                    low = str(exc).lower()
+                    if (
+                        "personal access token" in low
+                        or "resource not accessible" in low
+                        or "forbidden" in low
+                    ):
+                        print(
+                            "Hint: GraphQL auto-merge needs a PAT allowed to update PR merge settings — "
+                            "fine-grained: Repository permissions → Pull requests: Read and write "
+                            "(add this repo; authorize SSO if org-required). "
+                            "Repo → Settings → Pull Requests → Allow auto-merge must be on. "
+                            "If Greptile looks clean, this CLI will attempt a REST merge using "
+                            "the same method as GITHUB_AUTO_MERGE. Or fix the PAT and rely on "
+                            "GraphQL queue-only auto-merge.",
+                            file=sys.stderr,
+                        )
+                    elif "auto merge" in low or "automerge" in low or "workflow" in low:
+                        print(
+                            "Hint: Confirm the repository has **Allow auto-merge** enabled "
+                            "(Settings → General → Pull Requests) and branch protection allows "
+                            "the merge method you chose.",
+                            file=sys.stderr,
+                        )
 
             gr = _wait_greptile(
                 gh,
@@ -357,15 +667,30 @@ def main() -> None:
             if feedback_text:
                 print("--- Greptile feedback (truncated) ---\n", feedback_text[:4000])
 
-            if feedback_text and max_fix_rounds > 0:
+            skipped_fix_loop_for_clean_greptile = False
+
+            if max_fix_rounds <= 0:
+                print("MAX_FIX_ROUNDS=0 — skipping fix loop.")
+            elif not feedback_text:
+                print("Skipping Greptile fix rounds (no feedback text).")
+            elif _greptile_indicates_no_action_needed(
+                feedback_text,
+                extra_substrings=greptile_clean_substrings,
+            ):
+                print("Greptile feedback looks clean — skipping fix loop.")
+                skipped_fix_loop_for_clean_greptile = True
+            else:
                 for round_i in range(1, max_fix_rounds + 1):
                     print(f"\n=== Fix round {round_i}/{max_fix_rounds} (new cloud agent) ===")
+                    head_sha_before_fix, _ = get_pr_head(gh, repo, pull_number)
+                    round_started_iso = _utc_iso_z()
 
                     if max_parallel_fixers <= 1:
                         _run_single_fix_agent(
                             api_key,
                             pr_url=pr_url,
                             pull_number=pull_number,
+                            pr_head_ref=pr_head_ref_for_fix,
                             feedback_text=feedback_text,
                             model_id=model_id,
                             stop_mode=stop_mode,
@@ -376,6 +701,7 @@ def main() -> None:
                             api_key,
                             pr_url=pr_url,
                             pull_number=pull_number,
+                            pr_head_ref=pr_head_ref_for_fix,
                             chunks=chunks,
                             max_workers=max_parallel_fixers,
                             model_id=model_id,
@@ -385,7 +711,11 @@ def main() -> None:
                     print(f"Cooling down {fix_round_cooldown_s}s for Greptile to re-run…")
                     time.sleep(fix_round_cooldown_s)
 
-                    head_sha, _ = get_pr_head(gh, repo, pull_number)
+                    head_sha, pr_head_ref_for_fix = get_pr_head(gh, repo, pull_number)
+                    if head_sha == head_sha_before_fix:
+                        print("PR head SHA unchanged after fix round — stopping (no new commits).")
+                        break
+
                     after = poll_greptile_signal(
                         gh,
                         repo,
@@ -393,18 +723,78 @@ def main() -> None:
                         head_sha,
                         bot_substrings=bot_substrings,
                         check_name_substrings=check_substrings,
+                        comments_since_iso=round_started_iso,
                     )
                     joined = "\n".join(after.summary_parts).strip()
+                    if _greptile_indicates_no_action_needed(
+                        joined,
+                        extra_substrings=greptile_clean_substrings,
+                    ):
+                        print("Greptile indicates no remaining issues; stopping fix loop.")
+                        skipped_fix_loop_for_clean_greptile = True
+                        break
                     if not joined:
+                        if after.check_conclusion == "success":
+                            print(
+                                "Greptile check succeeded with no captured text after fix; "
+                                "stopping fix loop.",
+                            )
+                            break
                         print("No Greptile text after fix; stopping fix loop.")
                         break
                     feedback_text = joined
-            elif max_fix_rounds <= 0:
-                print("MAX_FIX_ROUNDS=0 — skipping fix loop.")
-            else:
-                print("Skipping Greptile fix rounds (no feedback text).")
 
             print("\nDone. PR:", pr_url)
+
+            rest_merge_method: str | None = github_merge_immediate
+            rest_merge_label = "GITHUB_MERGE_IMMEDIATE"
+            if (
+                not rest_merge_method
+                and github_merge_on_clean
+                and skipped_fix_loop_for_clean_greptile
+                and not graphql_auto_merge_enabled
+            ):
+                rest_merge_method = github_merge_on_clean
+                rest_merge_label = "GITHUB_MERGE_ON_GREPTILE_CLEAN"
+            elif (
+                github_merge_on_clean
+                and skipped_fix_loop_for_clean_greptile
+                and graphql_auto_merge_enabled
+                and not github_merge_immediate
+            ):
+                print(
+                    "Skipping GITHUB_MERGE_ON_GREPTILE_CLEAN — GitHub auto-merge already queued "
+                    "(GITHUB_AUTO_MERGE).",
+                )
+            elif (
+                not rest_merge_method
+                and skipped_fix_loop_for_clean_greptile
+                and graphql_auto_merge_failed
+                and github_auto_merge
+                and not github_merge_immediate
+            ):
+                rest_merge_method = github_auto_merge
+                rest_merge_label = "GITHUB_AUTO_MERGE (REST fallback)"
+                print(
+                    "GraphQL auto-merge failed — merging via REST API using "
+                    f"{github_auto_merge!r} (same as GITHUB_AUTO_MERGE).",
+                    file=sys.stderr,
+                )
+
+            if rest_merge_method:
+                merge_ok = _rest_merge_when_mergeable(
+                    gh,
+                    repo,
+                    pull_number,
+                    merge_method=rest_merge_method,
+                    merge_poll_budget_s=merge_poll_budget_s,
+                    merge_poll_interval_s=merge_poll_interval_s,
+                    env_label=rest_merge_label,
+                )
+                if not merge_ok:
+                    if continuous:
+                        break
+                    sys.exit(1)
 
             if not continuous:
                 break
@@ -412,16 +802,22 @@ def main() -> None:
             print(
                 f"Waiting up to {continuous_merge_wait_s:.0f}s for PR #{pull_number} to merge…",
             )
-            if not wait_pull_merged(
-                gh,
-                repo,
-                pull_number,
-                poll_interval_s=continuous_poll_s,
-                budget_s=continuous_merge_wait_s,
-            ):
+            try:
+                merged_in_wait = wait_pull_merged(
+                    gh,
+                    repo,
+                    pull_number,
+                    poll_interval_s=continuous_poll_s,
+                    budget_s=continuous_merge_wait_s,
+                )
+            except KeyboardInterrupt:
+                print("\norchestrate: interrupted during merge wait.", file=sys.stderr)
+                raise SystemExit(130) from None
+
+            if not merged_in_wait:
                 print(
                     "Timed out waiting for merge; stopping continuous loop "
-                    "(ensure auto-merge or merge manually; repo must allow it).",
+                    "(fix GITHUB_AUTO_MERGE PAT, use REST merge envs, or merge manually).",
                     file=sys.stderr,
                 )
                 break
