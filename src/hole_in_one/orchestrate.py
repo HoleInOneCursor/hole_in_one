@@ -66,6 +66,9 @@ DEFAULT_BUILDER_PROMPT = (
     "(for example: a helper script, a concise doc, or a tiny devtool that makes agent workflows nicer).\n"
     "Keep the change reviewable in under 15 minutes."
 )
+MAX_PARALLEL_FIXERS_CAP = 10
+MAX_WORKSTREAM_SUBAGENTS_CAP = 12
+MAX_PARALLEL_WORKSTREAMS_CAP = 10
 
 
 def _utc_iso_z() -> str:
@@ -748,7 +751,10 @@ def main() -> None:
     poll_interval_s = float(os.environ.get("GREPTILE_POLL_INTERVAL_S", "20"))
     poll_budget_s = float(os.environ.get("GREPTILE_POLL_BUDGET_S", "900"))
     max_fix_rounds = int(os.environ.get("MAX_FIX_ROUNDS", "3"))
-    max_parallel_fixers = min(5, max(1, int(os.environ.get("MAX_PARALLEL_FIXERS", "1"))))
+    max_parallel_fixers = min(
+        MAX_PARALLEL_FIXERS_CAP,
+        max(1, int(os.environ.get("MAX_PARALLEL_FIXERS", "1"))),
+    )
     max_feedback_chunks = int(os.environ.get("MAX_FEEDBACK_CHUNKS", "6"))
     fix_round_cooldown_s = float(os.environ.get("FIX_ROUND_COOLDOWN_S", "45"))
     stop_mode = os.environ.get("CURSOR_STOP_AGENT", "archive").strip()
@@ -835,11 +841,17 @@ def main() -> None:
         "1",
     ).strip().lower() not in ("0", "false", "no")
     max_workstream_subagents = (
-        min(8, max(1, int(os.environ.get("MAX_WORKSTREAM_SUBAGENTS", "3"))))
+        min(
+            MAX_WORKSTREAM_SUBAGENTS_CAP,
+            max(1, int(os.environ.get("MAX_WORKSTREAM_SUBAGENTS", "3"))),
+        )
         if workstream_subagents_enabled
         else 0
     )
-    max_parallel_workstreams = min(5, max(1, int(os.environ.get("MAX_PARALLEL_WORKSTREAMS", "2"))))
+    max_parallel_workstreams = min(
+        MAX_PARALLEL_WORKSTREAMS_CAP,
+        max(1, int(os.environ.get("MAX_PARALLEL_WORKSTREAMS", "2"))),
+    )
     workstream_subagents_strict = _env_truthy("WORKSTREAM_SUBAGENTS_STRICT")
     workstream_use_clod_planner = os.environ.get(
         "CLOD_WORKSTREAM_PLANNER",

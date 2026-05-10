@@ -38,7 +38,7 @@ npm run dev
 2. The builder is **stopped** (`CURSOR_STOP_AGENT`, default `archive`) once the PR is resolved.
 3. Optional workstream decomposition breaks the builder task into smaller slices and spawns **implementation subagents** on that same PR branch (`WORKSTREAM_SUBAGENTS_ENABLED=1`).
 4. Greptile reviews the PR; this CLI polls GitHub for checks/comments.
-5. Each fix round starts a **new** cloud agent scoped to that PR (`repos[0].prUrl`), then stops it when the run finishes. Use `MAX_PARALLEL_FIXERS>1` only if you accept possible branch contention (cap is 5).
+5. Each fix round starts a **new** cloud agent scoped to that PR (`repos[0].prUrl`), then stops it when the run finishes. Use `MAX_PARALLEL_FIXERS>1` only if you accept possible branch contention (cap is 10).
 6. **Continuous mode** (`CONTINUOUS_BUILDS=1` or `orchestrate --continuous`): after Greptile + fix rounds, wait until the PR **merges**, then start another builder on the same default branch so the repo keeps gaining small improvements.
 7. Exposes a FastAPI dashboard bridge at `GET /api/dashboard/snapshot` and `GET /api/dashboard/health` (default `http://127.0.0.1:8787`) so the Next.js dashboard can poll live orchestration state, including child subagents in tree/graph views.
 
