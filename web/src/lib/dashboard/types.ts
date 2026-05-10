@@ -59,17 +59,21 @@ export type DashboardSnapshot = {
   activityLines: string[];
   featureProgress: FeatureProgressSnapshot;
   controlsHint: string;
+  /** CLōD split builder steps; empty when not used. */
+  plannerTasks: string[];
+  /** Index into `plannerTasks` for the step in progress, or -1. */
+  plannerTaskIndex: number;
 };
 
 export const STATUS_COLORS: Record<AgentStatus, string> = {
-  running: "#4da3ff",
-  complete: "#5be26c",
-  failed: "#ff4545",
-  pending: "#f2d14f",
+  running: "#38bdf8",
+  complete: "#d8b4fe",
+  failed: "#f87171",
+  pending: "#fbbf24",
 };
 
 export const KIND_COLORS: Record<AgentKind, string> = {
-  builder: "#8db4ff",
-  implementation: "#6ace43",
-  fix: "#ffbf4a",
+  builder: "#c084fc",
+  implementation: "#67e8f9",
+  fix: "#fb923c",
 };

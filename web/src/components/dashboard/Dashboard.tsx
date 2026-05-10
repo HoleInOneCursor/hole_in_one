@@ -49,6 +49,13 @@ export function Dashboard() {
     return Math.round((snapshot.featureProgress.done / Math.max(1, snapshot.featureProgress.total)) * 100);
   }, [snapshot]);
 
+  const plannerTasks = snapshot?.plannerTasks ?? [];
+  const plannerIdxRaw = snapshot?.plannerTaskIndex ?? -1;
+  const plannerIdx =
+    plannerTasks.length > 0
+      ? Math.min(Math.max(0, plannerIdxRaw), plannerTasks.length - 1)
+      : -1;
+
   const tooltipPosition = useMemo(() => {
     if (!hoverCard) return null;
 
@@ -76,11 +83,51 @@ export function Dashboard() {
         <span className="brand">{snapshot.projectName}</span>
         <span className="muted">{snapshot.uptime}</span>
         <span className="muted">{snapshot.totalParallelAgents} agents in parallel</span>
-        <span className="bright-green">{snapshot.commitsPerHour.toLocaleString()} commits/hr</span>
+        <span className="header-stat-pill">{snapshot.commitsPerHour.toLocaleString()} commits/hr</span>
       </header>
 
       <section className="main-grid">
         <aside className="left-column">
+          <section className="panel panel-cyan planner-plan-panel">
+            <h3 className="panel-title">BUILDER PLAN</h3>
+            {plannerTasks.length > 0 ? (
+              <>
+                <div className="planner-task-meta">
+                  {plannerIdx >= 0 ? (
+                    <>
+                      Step {plannerIdx + 1} of {plannerTasks.length}
+                    </>
+                  ) : (
+                    <>Planner steps ({plannerTasks.length})</>
+                  )}
+                </div>
+                <ol className="planner-task-list">
+                  {plannerTasks.map((task, i) => (
+                    <li
+                      key={`planner-task-${i}`}
+                      className={i === plannerIdx ? "planner-task-current" : undefined}
+                      title={task}
+                    >
+                      {task}
+                    </li>
+                  ))}
+                </ol>
+              </>
+            ) : (
+              <p className="planner-task-empty">
+                Steps fill in when <code className="planner-code">hole_in_one</code> orchestrate is running
+                with the dashboard API (
+                <code className="planner-code">
+                  {process.env.NEXT_PUBLIC_DASHBOARD_API_BASE ?? "http://localhost:8787"}
+                </code>
+                ). To preview sample tasks here without Python, set{" "}
+                <code className="planner-code">NEXT_PUBLIC_DASHBOARD_MODE=mock</code> in{" "}
+                <code className="planner-code">web/.env.local</code> and restart{" "}
+                <code className="planner-code">npm run dev</code>.
+              </p>
+            )}
+          </section>
+
           <section className="panel panel-magenta merge-panel">
             <h3 className="panel-title">MERGE QUEUE</h3>
             <div className="kv-grid">
@@ -169,7 +216,7 @@ export function Dashboard() {
                   onNodeLeave={() => setHoverCard(null)}
                 />
               </div>
-              <section className="panel panel-green activity-slice">
+              <section className="panel panel-secondary activity-slice">
                 <h3 className="panel-title">Activity</h3>
                 <div className="activity-scroll">
                   {snapshot.activityLines.slice(-18).map((line, idx) => (
@@ -183,7 +230,7 @@ export function Dashboard() {
           ) : null}
 
           {tab === "activity" ? (
-            <section className="panel panel-green full-activity">
+            <section className="panel panel-secondary full-activity">
               <h3 className="panel-title">Timeline</h3>
               <div className="activity-scroll">
                 {snapshot.activityLines.map((line, idx) => (
@@ -196,7 +243,7 @@ export function Dashboard() {
           ) : null}
 
           {tab === "graph" ? (
-            <section className="panel panel-green graph-panel">
+            <section className="panel panel-secondary graph-panel">
               <h3 className="panel-title">Agent Flow Graph</h3>
               <ForceGraph
                 roots={snapshot.inProgress}
@@ -208,7 +255,7 @@ export function Dashboard() {
                   <strong>Shapes:</strong> builder circle, implementation circle, fix triangle
                 </span>
                 <span>
-                  <strong>Status:</strong> blue=running, green=complete, red=failed, yellow=pending
+                  <strong>Status:</strong> sky=running, violet=complete, red=failed, amber=pending
                 </span>
                 <span>{allWorking.length} working agents visualized</span>
               </div>

@@ -69,6 +69,8 @@ def _serialize_snapshot(snapshot: DashboardSnapshot) -> dict[str, Any]:
             "total": snapshot.feature_progress.total,
         },
         "controlsHint": snapshot.controls_hint,
+        "plannerTasks": list(snapshot.planner_tasks),
+        "plannerTaskIndex": snapshot.planner_task_index,
     }
 
 

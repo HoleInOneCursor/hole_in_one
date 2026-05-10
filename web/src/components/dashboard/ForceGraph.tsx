@@ -117,10 +117,10 @@ function trianglePoints(x: number, y: number, r: number): string {
 }
 
 function edgeColor(sourceStatus: AgentStatus): string {
-  if (sourceStatus === "failed") return "rgba(255, 69, 69, 0.5)";
-  if (sourceStatus === "complete") return "rgba(91, 226, 108, 0.5)";
-  if (sourceStatus === "pending") return "rgba(242, 209, 79, 0.45)";
-  return "rgba(77, 163, 255, 0.46)";
+  if (sourceStatus === "failed") return "rgba(248, 113, 113, 0.5)";
+  if (sourceStatus === "complete") return "rgba(216, 180, 254, 0.45)";
+  if (sourceStatus === "pending") return "rgba(251, 191, 36, 0.45)";
+  return "rgba(56, 189, 248, 0.46)";
 }
 
 function buildRenderData(sim: SimulationState): RenderData {

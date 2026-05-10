@@ -71,3 +71,5 @@ class DashboardSnapshot:
     activity_lines: list[str]
     feature_progress: FeatureProgressSnapshot
     controls_hint: str
+    planner_tasks: tuple[str, ...] = field(default_factory=tuple)
+    planner_task_index: int = -1
