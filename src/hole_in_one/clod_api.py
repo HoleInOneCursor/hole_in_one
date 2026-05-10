@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Literal
 
@@ -53,6 +54,77 @@ def _chat_completion(
     if not isinstance(content, str) or not content.strip():
         raise RuntimeError("CLōD returned empty content")
     return content.strip()
+
+
+def plan_builder_tasks(
+    goal: str,
+    *,
+    api_key: str,
+    base_url: str = DEFAULT_CLOD_BASE_URL,
+    model: str = DEFAULT_CLOD_MODEL,
+    max_tasks: int = 6,
+    timeout_s: float = 120.0,
+    max_completion_tokens: int = 2048,
+) -> list[str]:
+    """
+    Split one high-level product goal into ordered builder prompts (e.g. backend → frontend).
+    Each task is intended to become its own Cursor builder run / PR in sequence.
+    """
+    g = goal.strip()
+    if not g:
+        return []
+
+    system = (
+        "You break down one software goal into a **sequential** list of Cursor cloud-agent tasks.\n"
+        "Rules:\n"
+        "- Output **only** a JSON array of strings — no markdown fences, no commentary.\n"
+        "- Each string is a complete, actionable prompt for one repository PR.\n"
+        "- Order matters: earlier tasks should not depend on later ones (e.g. API/schema before UI).\n"
+        "- Prefer 2–5 tasks for full-stack work (backend / shared contracts / frontend / docs).\n"
+        "- Keep tasks scoped so parallel conflicts are unlikely when run sequentially on default branch.\n"
+        f"- At most {max_tasks} tasks."
+    )
+    user_msg = f"Goal to decompose:\n\n{g}"
+
+    raw = _chat_completion(
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_msg},
+        ],
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        timeout_s=timeout_s,
+        max_completion_tokens=max_completion_tokens,
+        temperature=0.2,
+    )
+
+    blob = raw.strip()
+    fence = re.match(r"^```(?:json)?\s*([\s\S]*?)\s*```\s*$", blob)
+    if fence:
+        blob = fence.group(1).strip()
+
+    try:
+        data = json.loads(blob)
+    except json.JSONDecodeError:
+        arr_match = re.search(r"\[[\s\S]*\]", blob)
+        if not arr_match:
+            raise RuntimeError(f"Planner returned non-JSON: {blob[:400]}") from None
+        data = json.loads(arr_match.group(0))
+
+    if not isinstance(data, list):
+        raise RuntimeError("Planner JSON must be an array of strings")
+
+    tasks: list[str] = []
+    for item in data[:max_tasks]:
+        if isinstance(item, str) and item.strip():
+            tasks.append(item.strip())
+        elif isinstance(item, dict) and "task" in item:
+            t = str(item.get("task", "")).strip()
+            if t:
+                tasks.append(t)
+
+    return tasks if tasks else [g]
 
 
 def compress_greptile_feedback_for_fix(

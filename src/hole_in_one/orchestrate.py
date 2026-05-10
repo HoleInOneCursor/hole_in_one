@@ -18,6 +18,7 @@ from hole_in_one.clod_api import (
     DEFAULT_CLOD_MODEL,
     clod_second_validator,
     compress_greptile_feedback_for_fix,
+    plan_builder_tasks,
 )
 from hole_in_one.dashboard_api import DashboardApiRuntime, start_dashboard_api_server
 from hole_in_one.dashboard_store import DashboardStore
@@ -478,7 +479,8 @@ def _rest_merge_when_mergeable(
 
 def main() -> None:
     prs = argparse.ArgumentParser(
-        description="Hole in One: Cursor builder + Greptile + optional fix rounds + continuous mode.",
+        description="Hole in One: Cursor builder + Greptile + optional fix rounds + continuous mode. "
+        "Use --plan (and CLOD_API_KEY) to split one goal into sequential builder tasks via CLōD.",
     )
     mx = prs.add_mutually_exclusive_group()
     mx.add_argument(
@@ -494,6 +496,12 @@ def main() -> None:
         help="Prompt on the terminal for the builder task (overrides BUILDER_PROMPT)",
     )
     prs.add_argument(
+        "--plan",
+        action="store_true",
+        help="Use CLōD (CLOD_API_KEY) to split --prompt / BUILDER_PROMPT into ordered builder tasks "
+        "(sequential PRs). Also enable with CLOD_PLANNER=1. Not with --continuous.",
+    )
+    prs.add_argument(
         "--continuous",
         action="store_true",
         help="After each PR run, wait for merge then start another builder (env CONTINUOUS_BUILDS=1)",
@@ -503,17 +511,17 @@ def main() -> None:
     if args.interactive_prompt:
         print("Task for the builder cloud agent (one line; Ctrl+C to cancel):")
         try:
-            builder_prompt = input("> ").strip()
+            base_goal = input("> ").strip()
         except EOFError:
             raise SystemExit("No prompt entered.") from None
-        if not builder_prompt:
+        if not base_goal:
             raise SystemExit("Empty prompt.")
     elif args.prompt is not None:
-        builder_prompt = args.prompt.strip()
-        if not builder_prompt:
+        base_goal = args.prompt.strip()
+        if not base_goal:
             raise SystemExit("Empty --prompt.")
     else:
-        builder_prompt = os.environ.get("BUILDER_PROMPT", DEFAULT_BUILDER_PROMPT)
+        base_goal = os.environ.get("BUILDER_PROMPT", DEFAULT_BUILDER_PROMPT)
 
     api_key = _env("CURSOR_API_KEY")
     gh_token = _env("GITHUB_TOKEN")
@@ -633,6 +641,47 @@ def main() -> None:
     if clod_validator_enabled and not clod_key:
         raise SystemExit("CLOD_VALIDATOR=1 requires CLOD_API_KEY.")
 
+    planner_enabled = args.plan or (
+        os.environ.get("CLOD_PLANNER", "").strip().lower() in ("1", "true", "yes")
+    )
+    if planner_enabled:
+        if not clod_key:
+            raise SystemExit("CLOD_PLANNER/--plan requires CLOD_API_KEY.")
+        planner_max = max(1, min(12, int(os.environ.get("CLOD_PLANNER_MAX_TASKS", "6"))))
+        planner_timeout_s = float(os.environ.get("CLOD_PLANNER_TIMEOUT_S", "120"))
+        planner_tokens = int(os.environ.get("CLOD_PLANNER_MAX_COMPLETION_TOKENS", "2048"))
+        print("\n=== CLōD planner (split goal into sequential builders) ===", flush=True)
+        try:
+            builder_prompts = plan_builder_tasks(
+                base_goal,
+                api_key=clod_key,
+                base_url=clod_shared_base,
+                model=clod_shared_model,
+                max_tasks=planner_max,
+                timeout_s=planner_timeout_s,
+                max_completion_tokens=planner_tokens,
+            )
+            print(f"Planner produced {len(builder_prompts)} task(s).", flush=True)
+            for i, t in enumerate(builder_prompts):
+                preview = t.replace("\n", " ").strip()
+                if len(preview) > 200:
+                    preview = preview[:200] + "…"
+                print(f"  {i + 1}. {preview}", flush=True)
+        except Exception as exc:
+            print(
+                f"Warning: CLōD planner failed ({exc}); using single builder prompt.",
+                file=sys.stderr,
+            )
+            builder_prompts = [base_goal]
+    else:
+        builder_prompts = [base_goal]
+
+    if len(builder_prompts) > 1 and continuous:
+        raise SystemExit(
+            "Multiple planner tasks cannot be combined with --continuous or CONTINUOUS_BUILDS=1. "
+            "Disable CLOD_PLANNER/--plan for continuous mode, or use a single-task goal.",
+        )
+
     queue_auto_merge = bool(github_auto_merge) and not github_merge_immediate
     if github_auto_merge and github_merge_immediate:
         print(
@@ -656,6 +705,8 @@ def main() -> None:
             extra_banner.append("clod-pr-append")
         if clod_validator_comment_pr:
             extra_banner.append("clod-pr-comment")
+    if planner_enabled:
+        extra_banner.append("clod-planner")
 
     dashboard_store: DashboardStore | None = None
     dashboard_api: DashboardApiRuntime | None = None
@@ -682,14 +733,10 @@ def main() -> None:
             print(f"Warning: could not start dashboard API: {exc}", file=sys.stderr)
 
     print(
-        f"Repo {repo_full} | new agent per Greptile fix | "
+        f"Repo {repo_full} | builder_tasks={len(builder_prompts)} | new agent per Greptile fix | "
         f"max_parallel_fixers={max_parallel_fixers} | stop={stop_mode}"
         f" | continuous={continuous}"
         + (f" | {' | '.join(extra_banner)}" if extra_banner else ""),
-    )
-
-    full_builder_prompt = (
-        builder_prompt + "\n\nOpen a normal (non-draft) PR with a clear title and description."
     )
 
     def _starting_ref_retryable(exc: CursorCloudError) -> bool:
@@ -731,657 +778,663 @@ def main() -> None:
                     "Push at least one commit, or set GITHUB_DEFAULT_BRANCH to an existing branch.",
                 )
 
-            cycle = 0
-            while True:
-                cycle += 1
-                if continuous:
-                    print(f"\n=== Continuous build cycle {cycle} ===")
-
-                if continuous and cycle > 1 and not explicit_branch:
-                    default_branch = get_default_branch(gh, repo)
-                if dashboard_store is not None:
-                    dashboard_store.set_iteration(cycle)
-                    dashboard_store.record_activity(
-                        "cycle",
-                        f"cycle {cycle} started on {default_branch}",
-                    )
-
-                refs_heads = f"refs/heads/{default_branch}"
-                pair = [("refs_heads", refs_heads), ("branch_name", default_branch)]
-                starting_attempts: list[tuple[str, str]] = pair if refs_first else [pair[1], pair[0]]
-                if refs_first and cycle == 1:
-                    print(
-                        "CURSOR_STARTING_REF_REFS_FIRST=1 — trying refs/heads before plain branch name.",
-                    )
-                if try_commit_sha:
-                    starting_attempts.append(
-                        ("commit_sha", get_branch_tip_sha(gh, repo, default_branch)),
-                    )
-
-                seen_refs: set[str] = set()
-                created: dict | None = None
-                last_exc: CursorCloudError | None = None
-                for label, start_ref in starting_attempts:
-                    if start_ref in seen_refs:
-                        continue
-                    seen_refs.add(start_ref)
-                    preview = (
-                        f"{start_ref[:12]}…{start_ref[-6:]}" if len(start_ref) > 44 else start_ref
-                    )
-                    print(f"create_agent startingRef ({label}): {preview}")
-                    try:
-                        created = create_agent(
-                            api_key,
-                            prompt_text=full_builder_prompt,
-                            repo_url=repo_url,
-                            starting_ref=start_ref,
-                            auto_create_pr=True,
-                            skip_reviewer_request=True,
-                            model_id=model_id,
+            for _task_i, builder_prompt in enumerate(builder_prompts):
+                if len(builder_prompts) > 1:
+                    print(f"\n=== Builder task {_task_i + 1}/{len(builder_prompts)} ===", flush=True)
+                full_builder_prompt = (
+                    builder_prompt + "\n\nOpen a normal (non-draft) PR with a clear title and description."
+                )
+                cycle = 0
+                while True:
+                    cycle += 1
+                    if continuous:
+                        print(f"\n=== Continuous build cycle {cycle} ===")
+    
+                    if continuous and cycle > 1 and not explicit_branch:
+                        default_branch = get_default_branch(gh, repo)
+                    if dashboard_store is not None:
+                        dashboard_store.set_iteration(cycle)
+                        dashboard_store.record_activity(
+                            "cycle",
+                            f"cycle {cycle} started on {default_branch}",
                         )
-                        break
-                    except CursorCloudError as exc:
-                        last_exc = exc
-                        if not _starting_ref_retryable(exc):
-                            raise
-                        snippet = (exc.body or "")[:280].replace("\n", " ")
+    
+                    refs_heads = f"refs/heads/{default_branch}"
+                    pair = [("refs_heads", refs_heads), ("branch_name", default_branch)]
+                    starting_attempts: list[tuple[str, str]] = pair if refs_first else [pair[1], pair[0]]
+                    if refs_first and cycle == 1:
                         print(
-                            f"  → Cursor rejected this startingRef; retrying. ({snippet})",
+                            "CURSOR_STARTING_REF_REFS_FIRST=1 — trying refs/heads before plain branch name.",
+                        )
+                    if try_commit_sha:
+                        starting_attempts.append(
+                            ("commit_sha", get_branch_tip_sha(gh, repo, default_branch)),
+                        )
+    
+                    seen_refs: set[str] = set()
+                    created: dict | None = None
+                    last_exc: CursorCloudError | None = None
+                    for label, start_ref in starting_attempts:
+                        if start_ref in seen_refs:
+                            continue
+                        seen_refs.add(start_ref)
+                        preview = (
+                            f"{start_ref[:12]}…{start_ref[-6:]}" if len(start_ref) > 44 else start_ref
+                        )
+                        print(f"create_agent startingRef ({label}): {preview}")
+                        try:
+                            created = create_agent(
+                                api_key,
+                                prompt_text=full_builder_prompt,
+                                repo_url=repo_url,
+                                starting_ref=start_ref,
+                                auto_create_pr=True,
+                                skip_reviewer_request=True,
+                                model_id=model_id,
+                            )
+                            break
+                        except CursorCloudError as exc:
+                            last_exc = exc
+                            if not _starting_ref_retryable(exc):
+                                raise
+                            snippet = (exc.body or "")[:280].replace("\n", " ")
+                            print(
+                                f"  → Cursor rejected this startingRef; retrying. ({snippet})",
+                                file=sys.stderr,
+                            )
+        
+                    if created is None:
+                        print(
+                            "\nAll startingRef attempts failed. "
+                            "If Cursor lists your repo under Integrations, contact Cursor support.\n",
                             file=sys.stderr,
                         )
+                        if last_exc:
+                            raise last_exc
+                        raise RuntimeError("create_agent failed without exception")
+        
+                    builder_id = created["agent"]["id"]
+                    run_id = created["run"]["id"]
+                    print(f"Builder agent: {builder_id}")
+                    if dashboard_store is not None:
+                        dashboard_store.add_or_update_root_agent(
+                            agent_id=builder_id,
+                            role="builder",
+                            task="Open PR from builder task",
+                            kind=AgentKind.BUILDER,
+                            status=AgentStatus.RUNNING,
+                            progress=8,
+                        )
+                        dashboard_store.record_activity(
+                            "builder",
+                            f"{builder_id} started on {default_branch}",
+                        )
     
-                if created is None:
-                    print(
-                        "\nAll startingRef attempts failed. "
-                        "If Cursor lists your repo under Integrations, contact Cursor support.\n",
-                        file=sys.stderr,
-                    )
-                    if last_exc:
-                        raise last_exc
-                    raise RuntimeError("create_agent failed without exception")
-    
-                builder_id = created["agent"]["id"]
-                run_id = created["run"]["id"]
-                print(f"Builder agent: {builder_id}")
-                if dashboard_store is not None:
-                    dashboard_store.add_or_update_root_agent(
-                        agent_id=builder_id,
-                        role="builder",
-                        task="Open PR from builder task",
-                        kind=AgentKind.BUILDER,
-                        status=AgentStatus.RUNNING,
-                        progress=8,
-                    )
-                    dashboard_store.record_activity(
-                        "builder",
-                        f"{builder_id} started on {default_branch}",
-                    )
-
-                initial = wait_for_terminal_run(api_key, builder_id, run_id)
-                if initial.get("status") != "FINISHED":
-                    print("Builder run failed:", initial, file=sys.stderr)
+                    initial = wait_for_terminal_run(api_key, builder_id, run_id)
+                    if initial.get("status") != "FINISHED":
+                        print("Builder run failed:", initial, file=sys.stderr)
+                        if dashboard_store is not None:
+                            dashboard_store.finish_agent(
+                                builder_id,
+                                success=False,
+                                note=f"{builder_id} failed builder run",
+                            )
+                        try:
+                            stop_agent(api_key, builder_id, stop_mode)
+                        except Exception as exc:
+                            print(f"Warning: could not stop builder agent: {exc}", file=sys.stderr)
+                        sys.exit(2)
                     if dashboard_store is not None:
                         dashboard_store.finish_agent(
                             builder_id,
-                            success=False,
-                            note=f"{builder_id} failed builder run",
+                            success=True,
+                            note=f"{builder_id} finished builder run",
                         )
+        
+                    pr_url: str | None = None
+                    pull_number: int | None = None
                     try:
-                        stop_agent(api_key, builder_id, stop_mode)
-                    except Exception as exc:
-                        print(f"Warning: could not stop builder agent: {exc}", file=sys.stderr)
-                    sys.exit(2)
-                if dashboard_store is not None:
-                    dashboard_store.finish_agent(
-                        builder_id,
-                        success=True,
-                        note=f"{builder_id} finished builder run",
-                    )
-    
-                pr_url: str | None = None
-                pull_number: int | None = None
-                try:
-                    agent_meta = get_agent(api_key, builder_id)
-                    branch_name = _branch_name_from_cursor_agent(agent_meta)
-                    if not branch_name:
-                        for attempt in range(10):
-                            time.sleep(3.0)
-                            agent_meta = get_agent(api_key, builder_id)
-                            branch_name = _branch_name_from_cursor_agent(agent_meta)
-                            if branch_name:
-                                print(f"Resolved branchName from Cursor API (poll {attempt + 2}).")
-                                break
-    
-                    pr_data = None
-                    if branch_name:
-                        pr_data = find_open_pr_for_branch(gh, repo, branch_name)
-    
-                    if not pr_data:
-                        ref_prefix = os.environ.get("CURSOR_PR_HEAD_PREFIX", "cursor/").strip() or "cursor/"
-                        guess = find_latest_open_pr_head_ref_prefix(gh, repo, ref_prefix=ref_prefix)
-                        if guess:
-                            pr_data = guess
-                            head = guess.get("head") or {}
-                            branch_name = str(head.get("ref") or branch_name or "")
+                        agent_meta = get_agent(api_key, builder_id)
+                        branch_name = _branch_name_from_cursor_agent(agent_meta)
+                        if not branch_name:
+                            for attempt in range(10):
+                                time.sleep(3.0)
+                                agent_meta = get_agent(api_key, builder_id)
+                                branch_name = _branch_name_from_cursor_agent(agent_meta)
+                                if branch_name:
+                                    print(f"Resolved branchName from Cursor API (poll {attempt + 2}).")
+                                    break
+        
+                        pr_data = None
+                        if branch_name:
+                            pr_data = find_open_pr_for_branch(gh, repo, branch_name)
+        
+                        if not pr_data:
+                            ref_prefix = os.environ.get("CURSOR_PR_HEAD_PREFIX", "cursor/").strip() or "cursor/"
+                            guess = find_latest_open_pr_head_ref_prefix(gh, repo, ref_prefix=ref_prefix)
+                            if guess:
+                                pr_data = guess
+                                head = guess.get("head") or {}
+                                branch_name = str(head.get("ref") or branch_name or "")
+                                print(
+                                    "No usable branchName on agent; using newest open PR whose head ref starts with "
+                                    f"{ref_prefix!r} → #{guess.get('number')} ({branch_name}). "
+                                    "Confirm this is the builder PR if several exist.",
+                                    file=sys.stderr,
+                                )
+        
+                        if not pr_data:
                             print(
-                                "No usable branchName on agent; using newest open PR whose head ref starts with "
-                                f"{ref_prefix!r} → #{guess.get('number')} ({branch_name}). "
-                                "Confirm this is the builder PR if several exist.",
+                                "Could not resolve builder PR: Cursor agent has no usable branchName "
+                                "and no matching open PR.",
                                 file=sys.stderr,
                             )
+                            print(
+                                f"Agent JSON (truncated):\n{json.dumps(agent_meta, indent=2)[:3500]}",
+                                file=sys.stderr,
+                            )
+                            sys.exit(2)
+        
+                        pr_url = pr_data.get("html_url")
+                        pull_number = pr_data.get("number") or pull_number_from_pr_url(pr_url)
+                        if not pull_number:
+                            print("Could not determine PR number.", file=sys.stderr)
+                            sys.exit(2)
     
-                    if not pr_data:
-                        print(
-                            "Could not resolve builder PR: Cursor agent has no usable branchName "
-                            "and no matching open PR.",
-                            file=sys.stderr,
-                        )
-                        print(
-                            f"Agent JSON (truncated):\n{json.dumps(agent_meta, indent=2)[:3500]}",
-                            file=sys.stderr,
-                        )
-                        sys.exit(2)
-    
-                    pr_url = pr_data.get("html_url")
-                    pull_number = pr_data.get("number") or pull_number_from_pr_url(pr_url)
-                    if not pull_number:
-                        print("Could not determine PR number.", file=sys.stderr)
-                        sys.exit(2)
-
-                    print("PR:", pr_url)
+                        print("PR:", pr_url)
+                        if dashboard_store is not None:
+                            dashboard_store.record_activity("pr", f"opened PR #{pull_number}: {pr_url}")
+                    finally:
+                        try:
+                            stop_agent(api_key, builder_id, stop_mode)
+                            print(f"Stopped builder agent ({stop_mode}): {builder_id}")
+                            if dashboard_store is not None:
+                                dashboard_store.record_activity(
+                                    "builder",
+                                    f"{builder_id} stopped ({stop_mode})",
+                                )
+                        except Exception as exc:
+                            print(f"Warning: could not stop builder agent: {exc}", file=sys.stderr)
+        
+                    assert pr_url is not None and pull_number is not None
+                    _, pr_head_ref_for_fix = get_pr_head(gh, repo, pull_number)
+        
+                    graphql_auto_merge_enabled = False
+                    graphql_auto_merge_failed = False
+                    if queue_auto_merge and github_auto_merge:
+                        try:
+                            enable_pull_request_auto_merge(gh, repo, pull_number, github_auto_merge)
+                            graphql_auto_merge_enabled = True
+                            print(
+                                f"Queued GitHub auto-merge ({github_auto_merge}); "
+                                "merges when required checks and branch rules pass.",
+                            )
+                            if dashboard_store is not None:
+                                dashboard_store.mark_merge_queued(pull_number, github_auto_merge)
+                        except Exception as exc:
+                            graphql_auto_merge_failed = True
+                            print(f"Warning: could not enable auto-merge: {exc}", file=sys.stderr)
+                            if dashboard_store is not None:
+                                dashboard_store.record_activity(
+                                    "failed",
+                                    f"auto-merge queue failed for PR #{pull_number}",
+                                )
+                            raw = str(exc)
+                            gql_prefix = "enablePullRequestAutoMerge failed: "
+                            msg_body = raw[len(gql_prefix) :] if raw.startswith(gql_prefix) else raw
+                            low = msg_body.lower()
+                            if (
+                                "personal access token" in low
+                                or "resource not accessible" in low
+                                or "forbidden" in low
+                            ):
+                                print(
+                                    "Hint: GraphQL auto-merge needs a PAT allowed to update PR merge settings — "
+                                    "fine-grained: Repository permissions → Pull requests: Read and write "
+                                    "(add this repo; authorize SSO if org-required). "
+                                    "Repo → Settings → Pull Requests → Allow auto-merge must be on. "
+                                    "If Greptile looks clean, this CLI will attempt a REST merge using "
+                                    "the same method as GITHUB_AUTO_MERGE. Or fix the PAT and rely on "
+                                    "GraphQL queue-only auto-merge.",
+                                    file=sys.stderr,
+                                )
+                            elif "clean status" in low:
+                                print(
+                                    "Hint: GitHub sometimes rejects queueing auto-merge when the PR is already "
+                                    "mergeable (mergeable_state=clean), e.g. branch protection has no **required** "
+                                    "status checks — auto-merge is for waiting on checks. Use a direct merge "
+                                    "(this CLI’s REST fallback after Greptile, or merge in the UI). "
+                                    "Add required checks on the base branch if you want true auto-merge queueing.",
+                                    file=sys.stderr,
+                                )
+                            elif (
+                                "auto merge" in low
+                                or "automerge" in low
+                                or "workflow" in low
+                                or "merge queue" in low
+                                or "branch protection" in low
+                            ):
+                                print(
+                                    "Hint: Confirm the repository has **Allow auto-merge** enabled "
+                                    "(Settings → General → Pull Requests), branch protection allows "
+                                    "the merge method you chose, and required checks/reviews match what "
+                                    "you expect.",
+                                    file=sys.stderr,
+                                )
+        
                     if dashboard_store is not None:
-                        dashboard_store.record_activity("pr", f"opened PR #{pull_number}: {pr_url}")
-                finally:
-                    try:
-                        stop_agent(api_key, builder_id, stop_mode)
-                        print(f"Stopped builder agent ({stop_mode}): {builder_id}")
+                        dashboard_store.record_activity(
+                            "greptile",
+                            f"waiting for review signal on PR #{pull_number}",
+                        )
+                    gr = _wait_greptile(
+                        gh,
+                        repo,
+                        pull_number,
+                        bot_substrings=bot_substrings,
+                        check_substrings=check_substrings,
+                        poll_interval_s=poll_interval_s,
+                        poll_budget_s=poll_budget_s,
+                        continuous=continuous,
+                    )
+        
+                    if gr.clean_success_no_text:
+                        feedback_text = ""
                         if dashboard_store is not None:
                             dashboard_store.record_activity(
-                                "builder",
-                                f"{builder_id} stopped ({stop_mode})",
+                                "greptile",
+                                f"PR #{pull_number} check passed with no text",
                             )
-                    except Exception as exc:
-                        print(f"Warning: could not stop builder agent: {exc}", file=sys.stderr)
-    
-                assert pr_url is not None and pull_number is not None
-                _, pr_head_ref_for_fix = get_pr_head(gh, repo, pull_number)
-    
-                graphql_auto_merge_enabled = False
-                graphql_auto_merge_failed = False
-                if queue_auto_merge and github_auto_merge:
-                    try:
-                        enable_pull_request_auto_merge(gh, repo, pull_number, github_auto_merge)
-                        graphql_auto_merge_enabled = True
+                    elif gr.timed_out:
                         print(
-                            f"Queued GitHub auto-merge ({github_auto_merge}); "
-                            "merges when required checks and branch rules pass.",
+                            "No Greptile feedback collected before timeout. "
+                            "Tune GREPTILE_* or comment @greptileai on the PR.",
                         )
-                        if dashboard_store is not None:
-                            dashboard_store.mark_merge_queued(pull_number, github_auto_merge)
-                    except Exception as exc:
-                        graphql_auto_merge_failed = True
-                        print(f"Warning: could not enable auto-merge: {exc}", file=sys.stderr)
+                        print("PR:", pr_url)
                         if dashboard_store is not None:
                             dashboard_store.record_activity(
                                 "failed",
-                                f"auto-merge queue failed for PR #{pull_number}",
+                                f"Greptile timed out for PR #{pull_number}",
                             )
-                        raw = str(exc)
-                        gql_prefix = "enablePullRequestAutoMerge failed: "
-                        msg_body = raw[len(gql_prefix) :] if raw.startswith(gql_prefix) else raw
-                        low = msg_body.lower()
-                        if (
-                            "personal access token" in low
-                            or "resource not accessible" in low
-                            or "forbidden" in low
-                        ):
-                            print(
-                                "Hint: GraphQL auto-merge needs a PAT allowed to update PR merge settings — "
-                                "fine-grained: Repository permissions → Pull requests: Read and write "
-                                "(add this repo; authorize SSO if org-required). "
-                                "Repo → Settings → Pull Requests → Allow auto-merge must be on. "
-                                "If Greptile looks clean, this CLI will attempt a REST merge using "
-                                "the same method as GITHUB_AUTO_MERGE. Or fix the PAT and rely on "
-                                "GraphQL queue-only auto-merge.",
-                                file=sys.stderr,
+                        if continuous:
+                            break
+                        sys.exit(0)
+                    else:
+                        feedback_text = gr.text
+                        if dashboard_store is not None:
+                            dashboard_store.record_activity(
+                                "greptile",
+                                f"captured feedback for PR #{pull_number}",
                             )
-                        elif "clean status" in low:
-                            print(
-                                "Hint: GitHub sometimes rejects queueing auto-merge when the PR is already "
-                                "mergeable (mergeable_state=clean), e.g. branch protection has no **required** "
-                                "status checks — auto-merge is for waiting on checks. Use a direct merge "
-                                "(this CLI’s REST fallback after Greptile, or merge in the UI). "
-                                "Add required checks on the base branch if you want true auto-merge queueing.",
-                                file=sys.stderr,
-                            )
-                        elif (
-                            "auto merge" in low
-                            or "automerge" in low
-                            or "workflow" in low
-                            or "merge queue" in low
-                            or "branch protection" in low
-                        ):
-                            print(
-                                "Hint: Confirm the repository has **Allow auto-merge** enabled "
-                                "(Settings → General → Pull Requests), branch protection allows "
-                                "the merge method you chose, and required checks/reviews match what "
-                                "you expect.",
-                                file=sys.stderr,
-                            )
-    
-                if dashboard_store is not None:
-                    dashboard_store.record_activity(
-                        "greptile",
-                        f"waiting for review signal on PR #{pull_number}",
-                    )
-                gr = _wait_greptile(
-                    gh,
-                    repo,
-                    pull_number,
-                    bot_substrings=bot_substrings,
-                    check_substrings=check_substrings,
-                    poll_interval_s=poll_interval_s,
-                    poll_budget_s=poll_budget_s,
-                    continuous=continuous,
-                )
-    
-                if gr.clean_success_no_text:
-                    feedback_text = ""
-                    if dashboard_store is not None:
-                        dashboard_store.record_activity(
-                            "greptile",
-                            f"PR #{pull_number} check passed with no text",
-                        )
-                elif gr.timed_out:
-                    print(
-                        "No Greptile feedback collected before timeout. "
-                        "Tune GREPTILE_* or comment @greptileai on the PR.",
-                    )
-                    print("PR:", pr_url)
-                    if dashboard_store is not None:
-                        dashboard_store.record_activity(
-                            "failed",
-                            f"Greptile timed out for PR #{pull_number}",
-                        )
-                    if continuous:
-                        break
-                    sys.exit(0)
-                else:
-                    feedback_text = gr.text
-                    if dashboard_store is not None:
-                        dashboard_store.record_activity(
-                            "greptile",
-                            f"captured feedback for PR #{pull_number}",
-                        )
-    
-                if feedback_text:
-                    print("--- Greptile feedback (truncated) ---\n", feedback_text[:4000])
-    
-                skipped_fix_loop_for_clean_greptile = False
-    
-                if max_fix_rounds <= 0:
-                    print("MAX_FIX_ROUNDS=0 — skipping fix loop.")
-                    if dashboard_store is not None:
-                        dashboard_store.record_activity("fix", "MAX_FIX_ROUNDS=0; skipped")
-                elif not feedback_text:
-                    print("Skipping Greptile fix rounds (no feedback text).")
-                    if dashboard_store is not None:
-                        dashboard_store.record_activity("fix", "no feedback text; skipped")
-                elif _greptile_indicates_no_action_needed(
-                    feedback_text,
-                    extra_substrings=greptile_clean_substrings,
-                ):
-                    print("Greptile feedback looks clean — skipping fix loop.")
-                    skipped_fix_loop_for_clean_greptile = True
-                    if dashboard_store is not None:
-                        dashboard_store.record_activity(
-                            "fix",
-                            f"Greptile clean for PR #{pull_number}; skipped",
-                        )
-                else:
-                    for round_i in range(1, max_fix_rounds + 1):
-                        print(f"\n=== Fix round {round_i}/{max_fix_rounds} (new cloud agent) ===")
+        
+                    if feedback_text:
+                        print("--- Greptile feedback (truncated) ---\n", feedback_text[:4000])
+        
+                    skipped_fix_loop_for_clean_greptile = False
+        
+                    if max_fix_rounds <= 0:
+                        print("MAX_FIX_ROUNDS=0 — skipping fix loop.")
+                        if dashboard_store is not None:
+                            dashboard_store.record_activity("fix", "MAX_FIX_ROUNDS=0; skipped")
+                    elif not feedback_text:
+                        print("Skipping Greptile fix rounds (no feedback text).")
+                        if dashboard_store is not None:
+                            dashboard_store.record_activity("fix", "no feedback text; skipped")
+                    elif _greptile_indicates_no_action_needed(
+                        feedback_text,
+                        extra_substrings=greptile_clean_substrings,
+                    ):
+                        print("Greptile feedback looks clean — skipping fix loop.")
+                        skipped_fix_loop_for_clean_greptile = True
                         if dashboard_store is not None:
                             dashboard_store.record_activity(
                                 "fix",
-                                f"round {round_i}/{max_fix_rounds} started on PR #{pull_number}",
+                                f"Greptile clean for PR #{pull_number}; skipped",
                             )
-                        head_sha_before_fix, _ = get_pr_head(gh, repo, pull_number)
-                        round_started_iso = _utc_iso_z()
-    
-                        fix_prompt_feedback = _maybe_clod_compress(feedback_text, clod_cfg)
-    
-                        if max_parallel_fixers <= 1:
-                            _run_single_fix_agent(
-                                api_key,
-                                pr_url=pr_url,
-                                pull_number=pull_number,
-                                pr_head_ref=pr_head_ref_for_fix,
-                                feedback_text=fix_prompt_feedback,
-                                model_id=model_id,
-                                stop_mode=stop_mode,
-                                dashboard=dashboard_store,
-                            )
-                        else:
-                            chunks = split_feedback(fix_prompt_feedback, max_feedback_chunks)
-                            _parallel_fix_agents(
-                                api_key,
-                                pr_url=pr_url,
-                                pull_number=pull_number,
-                                pr_head_ref=pr_head_ref_for_fix,
-                                chunks=chunks,
-                                max_workers=max_parallel_fixers,
-                                model_id=model_id,
-                                stop_mode=stop_mode,
-                                dashboard=dashboard_store,
-                            )
-    
-                        print(f"Cooling down {fix_round_cooldown_s}s for Greptile to re-run…")
-                        time.sleep(fix_round_cooldown_s)
-    
-                        head_sha, pr_head_ref_for_fix = get_pr_head(gh, repo, pull_number)
-                        if head_sha == head_sha_before_fix:
-                            print("PR head SHA unchanged after fix round — stopping (no new commits).")
+                    else:
+                        for round_i in range(1, max_fix_rounds + 1):
+                            print(f"\n=== Fix round {round_i}/{max_fix_rounds} (new cloud agent) ===")
                             if dashboard_store is not None:
                                 dashboard_store.record_activity(
                                     "fix",
-                                    "no commit change after fix round; stopping",
+                                    f"round {round_i}/{max_fix_rounds} started on PR #{pull_number}",
                                 )
-                            break
-    
-                        after = poll_greptile_signal(
-                            gh,
-                            repo,
-                            pull_number,
-                            head_sha,
-                            bot_substrings=bot_substrings,
-                            check_name_substrings=check_substrings,
-                            comments_since_iso=round_started_iso,
-                        )
-                        joined = "\n".join(after.summary_parts).strip()
-                        if not joined:
-                            latest_issue = fetch_latest_greptile_issue_comment_body(
-                                gh,
-                                repo,
-                                pull_number,
-                                bot_substrings=bot_substrings,
-                            )
-                            if latest_issue:
-                                joined = latest_issue
-                                print(
-                                    "Recovered Greptile summary from latest issue comment "
-                                    "(post-fix poll had no new-comment window match).",
-                                    file=sys.stderr,
+                            head_sha_before_fix, _ = get_pr_head(gh, repo, pull_number)
+                            round_started_iso = _utc_iso_z()
+        
+                            fix_prompt_feedback = _maybe_clod_compress(feedback_text, clod_cfg)
+        
+                            if max_parallel_fixers <= 1:
+                                _run_single_fix_agent(
+                                    api_key,
+                                    pr_url=pr_url,
+                                    pull_number=pull_number,
+                                    pr_head_ref=pr_head_ref_for_fix,
+                                    feedback_text=fix_prompt_feedback,
+                                    model_id=model_id,
+                                    stop_mode=stop_mode,
+                                    dashboard=dashboard_store,
                                 )
-                                if dashboard_store is not None:
-                                    dashboard_store.record_activity(
-                                        "greptile",
-                                        "recovered summary from latest issue comment",
-                                    )
-
-                                mirror_raw = os.environ.get(
-                                    "GREPTILE_MIRROR_FALLBACK_COMMENT",
-                                    "1",
-                                ).strip().lower()
-                                mirror_fallback = mirror_raw not in ("0", "false", "no")
-                                if mirror_fallback:
-                                    cap = 62000
-                                    snap = (
-                                        joined if len(joined) <= cap else joined[:cap] + "\n\n_(truncated)_"
-                                    )
-                                    mirror_body = (
-                                        "**Greptile summary (orchestrate snapshot)** — posted because "
-                                        "Greptile often *edits* its summary in place; fresh timeline "
-                                        "comments surface the current text for bots and humans.\n\n"
-                                        + snap
-                                    )
-                                    try:
-                                        create_pull_issue_comment(
-                                            gh,
-                                            repo,
-                                            pull_number,
-                                            mirror_body,
-                                        )
-                                        print(
-                                            "Posted Greptile snapshot as a new PR issue comment.",
-                                            file=sys.stderr,
-                                        )
-                                    except Exception as exc:
-                                        print(
-                                            f"Warning: could not post Greptile snapshot comment ({exc}).",
-                                            file=sys.stderr,
-                                        )
-
-                        if _greptile_indicates_no_action_needed(
-                            joined,
-                            extra_substrings=greptile_clean_substrings,
-                        ):
-                            print("Greptile indicates no remaining issues; stopping fix loop.")
-                            skipped_fix_loop_for_clean_greptile = True
-                            if dashboard_store is not None:
-                                dashboard_store.record_activity(
-                                    "fix",
-                                    "Greptile indicates no remaining issues",
+                            else:
+                                chunks = split_feedback(fix_prompt_feedback, max_feedback_chunks)
+                                _parallel_fix_agents(
+                                    api_key,
+                                    pr_url=pr_url,
+                                    pull_number=pull_number,
+                                    pr_head_ref=pr_head_ref_for_fix,
+                                    chunks=chunks,
+                                    max_workers=max_parallel_fixers,
+                                    model_id=model_id,
+                                    stop_mode=stop_mode,
+                                    dashboard=dashboard_store,
                                 )
-                            break
-                        if not joined:
-                            if after.check_conclusion == "success":
-                                print(
-                                    "Greptile check succeeded with no captured text after fix; "
-                                    "stopping fix loop.",
-                                )
+        
+                            print(f"Cooling down {fix_round_cooldown_s}s for Greptile to re-run…")
+                            time.sleep(fix_round_cooldown_s)
+        
+                            head_sha, pr_head_ref_for_fix = get_pr_head(gh, repo, pull_number)
+                            if head_sha == head_sha_before_fix:
+                                print("PR head SHA unchanged after fix round — stopping (no new commits).")
                                 if dashboard_store is not None:
                                     dashboard_store.record_activity(
                                         "fix",
-                                        "Greptile success after fix round",
+                                        "no commit change after fix round; stopping",
                                     )
                                 break
-                            print("No Greptile text after fix; stopping fix loop.")
-                            if dashboard_store is not None:
-                                dashboard_store.record_activity(
-                                    "fix",
-                                    "no Greptile text after fix round; stopping",
+        
+                            after = poll_greptile_signal(
+                                gh,
+                                repo,
+                                pull_number,
+                                head_sha,
+                                bot_substrings=bot_substrings,
+                                check_name_substrings=check_substrings,
+                                comments_since_iso=round_started_iso,
+                            )
+                            joined = "\n".join(after.summary_parts).strip()
+                            if not joined:
+                                latest_issue = fetch_latest_greptile_issue_comment_body(
+                                    gh,
+                                    repo,
+                                    pull_number,
+                                    bot_substrings=bot_substrings,
                                 )
-                            break
-                        feedback_text = joined
+                                if latest_issue:
+                                    joined = latest_issue
+                                    print(
+                                        "Recovered Greptile summary from latest issue comment "
+                                        "(post-fix poll had no new-comment window match).",
+                                        file=sys.stderr,
+                                    )
+                                    if dashboard_store is not None:
+                                        dashboard_store.record_activity(
+                                            "greptile",
+                                            "recovered summary from latest issue comment",
+                                        )
     
-                print("\nDone. PR:", pr_url)
-                if dashboard_store is not None:
-                    dashboard_store.record_activity("pr", f"cycle done for PR #{pull_number}")
+                                    mirror_raw = os.environ.get(
+                                        "GREPTILE_MIRROR_FALLBACK_COMMENT",
+                                        "1",
+                                    ).strip().lower()
+                                    mirror_fallback = mirror_raw not in ("0", "false", "no")
+                                    if mirror_fallback:
+                                        cap = 62000
+                                        snap = (
+                                            joined if len(joined) <= cap else joined[:cap] + "\n\n_(truncated)_"
+                                        )
+                                        mirror_body = (
+                                            "**Greptile summary (orchestrate snapshot)** — posted because "
+                                            "Greptile often *edits* its summary in place; fresh timeline "
+                                            "comments surface the current text for bots and humans.\n\n"
+                                            + snap
+                                        )
+                                        try:
+                                            create_pull_issue_comment(
+                                                gh,
+                                                repo,
+                                                pull_number,
+                                                mirror_body,
+                                            )
+                                            print(
+                                                "Posted Greptile snapshot as a new PR issue comment.",
+                                                file=sys.stderr,
+                                            )
+                                        except Exception as exc:
+                                            print(
+                                                f"Warning: could not post Greptile snapshot comment ({exc}).",
+                                                file=sys.stderr,
+                                            )
     
-                if clod_validator_enabled:
-                    print("\n=== CLōD second validator ===")
-                    verdict = "UNKNOWN"
-                    vbody = ""
-                    patch_bundle = ""
-                    validator_exc: BaseException | None = None
-                    try:
-                        patch_bundle = fetch_pull_request_patch_bundle(
+                            if _greptile_indicates_no_action_needed(
+                                joined,
+                                extra_substrings=greptile_clean_substrings,
+                            ):
+                                print("Greptile indicates no remaining issues; stopping fix loop.")
+                                skipped_fix_loop_for_clean_greptile = True
+                                if dashboard_store is not None:
+                                    dashboard_store.record_activity(
+                                        "fix",
+                                        "Greptile indicates no remaining issues",
+                                    )
+                                break
+                            if not joined:
+                                if after.check_conclusion == "success":
+                                    print(
+                                        "Greptile check succeeded with no captured text after fix; "
+                                        "stopping fix loop.",
+                                    )
+                                    if dashboard_store is not None:
+                                        dashboard_store.record_activity(
+                                            "fix",
+                                            "Greptile success after fix round",
+                                        )
+                                    break
+                                print("No Greptile text after fix; stopping fix loop.")
+                                if dashboard_store is not None:
+                                    dashboard_store.record_activity(
+                                        "fix",
+                                        "no Greptile text after fix round; stopping",
+                                    )
+                                break
+                            feedback_text = joined
+        
+                    print("\nDone. PR:", pr_url)
+                    if dashboard_store is not None:
+                        dashboard_store.record_activity("pr", f"cycle done for PR #{pull_number}")
+        
+                    if clod_validator_enabled:
+                        print("\n=== CLōD second validator ===")
+                        verdict = "UNKNOWN"
+                        vbody = ""
+                        patch_bundle = ""
+                        validator_exc: BaseException | None = None
+                        try:
+                            patch_bundle = fetch_pull_request_patch_bundle(
+                                gh,
+                                repo,
+                                pull_number,
+                                max_total_chars=clod_validator_max_patch_chars,
+                            )
+                            verdict, vbody = clod_second_validator(
+                                greptile_summary=feedback_text,
+                                patch_bundle=patch_bundle,
+                                api_key=clod_key,
+                                base_url=clod_shared_base,
+                                model=clod_shared_model,
+                                timeout_s=clod_validator_timeout_s,
+                                max_completion_tokens=clod_validator_max_completion_tokens,
+                                max_greptile_chars=clod_validator_max_greptile_chars,
+                                max_patch_chars=clod_validator_max_patch_chars,
+                            )
+                        except Exception as exc:
+                            validator_exc = exc
+                            print(
+                                f"Warning: CLōD validator failed ({exc}); verdict UNKNOWN (non-blocking).",
+                                file=sys.stderr,
+                            )
+        
+                        print(f"CLōD validator verdict: {verdict}")
+                        if vbody.strip():
+                            print(vbody[:8000])
+        
+                        if clod_validator_append_pr or clod_validator_comment_pr:
+                            stamp = _utc_iso_z()
+                            inner = _clod_validator_pr_blurb(
+                                stamp=stamp,
+                                verdict=verdict,
+                                vbody=vbody,
+                                validator_exc=validator_exc,
+                                pr_url=pr_url,
+                                pull_number=pull_number,
+                                clod_model=clod_shared_model,
+                                greptile_raw=feedback_text,
+                                patch_bundle=patch_bundle,
+                            )
+                            append_cap = int(os.environ.get("CLOD_VALIDATOR_PR_MAX_CHARS", "45000"))
+                            if len(inner) > append_cap:
+                                inner = inner[:append_cap] + "\n\n_(truncated)_"
+                            try:
+                                if clod_validator_append_pr:
+                                    cur_body = get_pull_request_body(gh, repo, pull_number)
+                                    merged = merge_clod_validator_pr_section(cur_body, inner)
+                                    update_pull_request_body(gh, repo, pull_number, merged)
+                                    print(
+                                        "Updated PR description with CLōD validator section.",
+                                        file=sys.stderr,
+                                    )
+                                if clod_validator_comment_pr:
+                                    comment_body = _clod_validator_pr_blurb(
+                                        stamp=stamp,
+                                        verdict=verdict,
+                                        vbody=vbody,
+                                        validator_exc=validator_exc,
+                                        pr_url=pr_url,
+                                        pull_number=pull_number,
+                                        clod_model=clod_shared_model,
+                                        greptile_raw=feedback_text,
+                                        patch_bundle=patch_bundle,
+                                    )
+                                    comment_cap = 65000
+                                    if len(comment_body) > comment_cap:
+                                        comment_body = comment_body[:comment_cap] + "\n\n_(truncated)_"
+                                    create_pull_issue_comment(gh, repo, pull_number, comment_body)
+                                    print(
+                                        "Posted CLōD validator as a PR comment.",
+                                        file=sys.stderr,
+                                    )
+                            except Exception as exc:
+                                print(
+                                    f"Warning: could not publish CLōD validator to GitHub ({exc}).",
+                                    file=sys.stderr,
+                                )
+        
+                        if clod_validator_strict and verdict == "FAIL":
+                            print(
+                                "CLōD validator STRICT: FAIL — stopping before REST merge / merge wait. "
+                                "Note: GraphQL auto-merge may already be queued (GITHUB_AUTO_MERGE).",
+                                file=sys.stderr,
+                            )
+                            if continuous:
+                                break
+                            sys.exit(1)
+        
+                    rest_merge_method: str | None = github_merge_immediate
+                    rest_merge_label = "GITHUB_MERGE_IMMEDIATE"
+                    if (
+                        not rest_merge_method
+                        and github_merge_on_clean
+                        and skipped_fix_loop_for_clean_greptile
+                        and not graphql_auto_merge_enabled
+                    ):
+                        rest_merge_method = github_merge_on_clean
+                        rest_merge_label = "GITHUB_MERGE_ON_GREPTILE_CLEAN"
+                    elif (
+                        github_merge_on_clean
+                        and skipped_fix_loop_for_clean_greptile
+                        and graphql_auto_merge_enabled
+                        and not github_merge_immediate
+                    ):
+                        print(
+                            "Skipping GITHUB_MERGE_ON_GREPTILE_CLEAN — GitHub auto-merge already queued "
+                            "(GITHUB_AUTO_MERGE).",
+                        )
+                    elif (
+                        not rest_merge_method
+                        and skipped_fix_loop_for_clean_greptile
+                        and graphql_auto_merge_failed
+                        and github_auto_merge
+                        and not github_merge_immediate
+                    ):
+                        rest_merge_method = github_auto_merge
+                        rest_merge_label = "GITHUB_AUTO_MERGE (REST fallback)"
+                        print(
+                            "GraphQL auto-merge failed — merging via REST API using "
+                            f"{github_auto_merge!r} (same as GITHUB_AUTO_MERGE).",
+                            file=sys.stderr,
+                        )
+        
+                    if rest_merge_method:
+                        merge_ok = _rest_merge_when_mergeable(
                             gh,
                             repo,
                             pull_number,
-                            max_total_chars=clod_validator_max_patch_chars,
+                            merge_method=rest_merge_method,
+                            merge_poll_budget_s=merge_poll_budget_s,
+                            merge_poll_interval_s=merge_poll_interval_s,
+                            env_label=rest_merge_label,
                         )
-                        verdict, vbody = clod_second_validator(
-                            greptile_summary=feedback_text,
-                            patch_bundle=patch_bundle,
-                            api_key=clod_key,
-                            base_url=clod_shared_base,
-                            model=clod_shared_model,
-                            timeout_s=clod_validator_timeout_s,
-                            max_completion_tokens=clod_validator_max_completion_tokens,
-                            max_greptile_chars=clod_validator_max_greptile_chars,
-                            max_patch_chars=clod_validator_max_patch_chars,
-                        )
-                    except Exception as exc:
-                        validator_exc = exc
-                        print(
-                            f"Warning: CLōD validator failed ({exc}); verdict UNKNOWN (non-blocking).",
-                            file=sys.stderr,
-                        )
-    
-                    print(f"CLōD validator verdict: {verdict}")
-                    if vbody.strip():
-                        print(vbody[:8000])
-    
-                    if clod_validator_append_pr or clod_validator_comment_pr:
-                        stamp = _utc_iso_z()
-                        inner = _clod_validator_pr_blurb(
-                            stamp=stamp,
-                            verdict=verdict,
-                            vbody=vbody,
-                            validator_exc=validator_exc,
-                            pr_url=pr_url,
-                            pull_number=pull_number,
-                            clod_model=clod_shared_model,
-                            greptile_raw=feedback_text,
-                            patch_bundle=patch_bundle,
-                        )
-                        append_cap = int(os.environ.get("CLOD_VALIDATOR_PR_MAX_CHARS", "45000"))
-                        if len(inner) > append_cap:
-                            inner = inner[:append_cap] + "\n\n_(truncated)_"
-                        try:
-                            if clod_validator_append_pr:
-                                cur_body = get_pull_request_body(gh, repo, pull_number)
-                                merged = merge_clod_validator_pr_section(cur_body, inner)
-                                update_pull_request_body(gh, repo, pull_number, merged)
-                                print(
-                                    "Updated PR description with CLōD validator section.",
-                                    file=sys.stderr,
+                        if not merge_ok:
+                            if dashboard_store is not None:
+                                dashboard_store.mark_merge_failure(
+                                    pull_number,
+                                    f"{rest_merge_label} {rest_merge_method} failed",
                                 )
-                            if clod_validator_comment_pr:
-                                comment_body = _clod_validator_pr_blurb(
-                                    stamp=stamp,
-                                    verdict=verdict,
-                                    vbody=vbody,
-                                    validator_exc=validator_exc,
-                                    pr_url=pr_url,
-                                    pull_number=pull_number,
-                                    clod_model=clod_shared_model,
-                                    greptile_raw=feedback_text,
-                                    patch_bundle=patch_bundle,
-                                )
-                                comment_cap = 65000
-                                if len(comment_body) > comment_cap:
-                                    comment_body = comment_body[:comment_cap] + "\n\n_(truncated)_"
-                                create_pull_issue_comment(gh, repo, pull_number, comment_body)
-                                print(
-                                    "Posted CLōD validator as a PR comment.",
-                                    file=sys.stderr,
-                                )
-                        except Exception as exc:
-                            print(
-                                f"Warning: could not publish CLōD validator to GitHub ({exc}).",
-                                file=sys.stderr,
-                            )
-    
-                    if clod_validator_strict and verdict == "FAIL":
-                        print(
-                            "CLōD validator STRICT: FAIL — stopping before REST merge / merge wait. "
-                            "Note: GraphQL auto-merge may already be queued (GITHUB_AUTO_MERGE).",
-                            file=sys.stderr,
-                        )
-                        if continuous:
-                            break
-                        sys.exit(1)
-    
-                rest_merge_method: str | None = github_merge_immediate
-                rest_merge_label = "GITHUB_MERGE_IMMEDIATE"
-                if (
-                    not rest_merge_method
-                    and github_merge_on_clean
-                    and skipped_fix_loop_for_clean_greptile
-                    and not graphql_auto_merge_enabled
-                ):
-                    rest_merge_method = github_merge_on_clean
-                    rest_merge_label = "GITHUB_MERGE_ON_GREPTILE_CLEAN"
-                elif (
-                    github_merge_on_clean
-                    and skipped_fix_loop_for_clean_greptile
-                    and graphql_auto_merge_enabled
-                    and not github_merge_immediate
-                ):
-                    print(
-                        "Skipping GITHUB_MERGE_ON_GREPTILE_CLEAN — GitHub auto-merge already queued "
-                        "(GITHUB_AUTO_MERGE).",
-                    )
-                elif (
-                    not rest_merge_method
-                    and skipped_fix_loop_for_clean_greptile
-                    and graphql_auto_merge_failed
-                    and github_auto_merge
-                    and not github_merge_immediate
-                ):
-                    rest_merge_method = github_auto_merge
-                    rest_merge_label = "GITHUB_AUTO_MERGE (REST fallback)"
-                    print(
-                        "GraphQL auto-merge failed — merging via REST API using "
-                        f"{github_auto_merge!r} (same as GITHUB_AUTO_MERGE).",
-                        file=sys.stderr,
-                    )
-    
-                if rest_merge_method:
-                    merge_ok = _rest_merge_when_mergeable(
-                        gh,
-                        repo,
-                        pull_number,
-                        merge_method=rest_merge_method,
-                        merge_poll_budget_s=merge_poll_budget_s,
-                        merge_poll_interval_s=merge_poll_interval_s,
-                        env_label=rest_merge_label,
-                    )
-                    if not merge_ok:
+                            if continuous:
+                                break
+                            sys.exit(1)
                         if dashboard_store is not None:
-                            dashboard_store.mark_merge_failure(
+                            dashboard_store.mark_pr_merged(pull_number)
+    
+                    if not continuous:
+                        break
+        
+                    print(
+                        f"Waiting up to {continuous_merge_wait_s:.0f}s for PR #{pull_number} to merge…",
+                    )
+                    if dashboard_store is not None:
+                        dashboard_store.record_activity(
+                            "merge",
+                            f"waiting for PR #{pull_number} merge",
+                        )
+                    try:
+                        merged_in_wait = wait_pull_merged(
+                            gh,
+                            repo,
+                            pull_number,
+                            poll_interval_s=continuous_poll_s,
+                            budget_s=continuous_merge_wait_s,
+                        )
+                    except KeyboardInterrupt:
+                        print("\norchestrate: interrupted during merge wait.", file=sys.stderr)
+                        raise SystemExit(130) from None
+        
+                    if not merged_in_wait:
+                        print(
+                            "Timed out waiting for merge; stopping continuous loop "
+                            "(fix GITHUB_AUTO_MERGE PAT, use REST merge envs, or merge manually).",
+                            file=sys.stderr,
+                        )
+                        if dashboard_store is not None:
+                            dashboard_store.mark_merge_conflict(
                                 pull_number,
-                                f"{rest_merge_label} {rest_merge_method} failed",
+                                "timed out waiting for merge",
                             )
-                        if continuous:
-                            break
-                        sys.exit(1)
+                        break
+    
+                    print("PR merged; cooling down before next builder.")
                     if dashboard_store is not None:
                         dashboard_store.mark_pr_merged(pull_number)
-
-                if not continuous:
-                    break
-    
-                print(
-                    f"Waiting up to {continuous_merge_wait_s:.0f}s for PR #{pull_number} to merge…",
-                )
-                if dashboard_store is not None:
-                    dashboard_store.record_activity(
-                        "merge",
-                        f"waiting for PR #{pull_number} merge",
-                    )
-                try:
-                    merged_in_wait = wait_pull_merged(
-                        gh,
-                        repo,
-                        pull_number,
-                        poll_interval_s=continuous_poll_s,
-                        budget_s=continuous_merge_wait_s,
-                    )
-                except KeyboardInterrupt:
-                    print("\norchestrate: interrupted during merge wait.", file=sys.stderr)
-                    raise SystemExit(130) from None
-    
-                if not merged_in_wait:
-                    print(
-                        "Timed out waiting for merge; stopping continuous loop "
-                        "(fix GITHUB_AUTO_MERGE PAT, use REST merge envs, or merge manually).",
-                        file=sys.stderr,
-                    )
-                    if dashboard_store is not None:
-                        dashboard_store.mark_merge_conflict(
-                            pull_number,
-                            "timed out waiting for merge",
-                        )
-                    break
-
-                print("PR merged; cooling down before next builder.")
-                if dashboard_store is not None:
-                    dashboard_store.mark_pr_merged(pull_number)
-                time.sleep(continuous_sleep_s)
+                    time.sleep(continuous_sleep_s)
     finally:
         if dashboard_api is not None:
             dashboard_api.stop()

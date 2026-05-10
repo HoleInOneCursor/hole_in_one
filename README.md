@@ -66,6 +66,11 @@ orchestrate
 orchestrate --prompt "Add a README section on agent ergonomics."
 orchestrate -i   # type the task when prompted
 
+# One high-level goal → CLōD splits into sequential builders (backend → frontend, etc.):
+# CLOD_API_KEY=…   CLOD_PLANNER=1   orchestrate --prompt "Build a minimal full-stack …"
+# Or: orchestrate --prompt "…" --plan
+# Not compatible with --continuous / CONTINUOUS_BUILDS when multiple tasks are planned.
+
 # Keep shipping after each merge (set in .env or use flag):
 # CONTINUOUS_BUILDS=1
 # GITHUB_MERGE_IMMEDIATE=squash   # or GITHUB_AUTO_MERGE=squash if Allow auto-merge is on
