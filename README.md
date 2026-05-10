@@ -21,6 +21,9 @@ npm run dev
 ```
 
 Open `http://localhost:3000`.
+5. **Continuous mode** (`CONTINUOUS_BUILDS=1` or `orchestrate --continuous`): after Greptile + fix rounds, wait until the PR **merges**, then start another builder on the same default branch so the repo keeps gaining small improvements.
+
+Set **`GITHUB_AUTO_MERGE=merge`** (or `squash` / `rebase`) so each new PR **queues GitHub auto-merge** as soon as the CLI knows the PR number (merging still waits on your checks and branch protection). Repo setting **Allow auto-merge** must be on; the PAT needs **Pull requests: write** for the GraphQL call.
 
 ## Quick start (backend loop)
 
@@ -32,12 +35,11 @@ pip install -e .
 cp .env.example .env
 # fill CURSOR_API_KEY, GITHUB_TOKEN, GITHUB_REPO
 
-# run backend orchestration loop
-orchestrate backend
-# or: orchestrate-loop
+orchestrate
+# or: python -m hole_in_one.orchestrate
 ```
 
-Prerequisites: Greptile GitHub app on the repo; Cursor Cloud connected to that repo; optional `triggerOnUpdates` in `greptile.json` so re-review runs after pushes.
+Prerequisites: Greptile GitHub app on the repo; Cursor Cloud connected to that repo; optional `triggerOnUpdates` in `greptile.json` so re-review runs after pushes. **`GITHUB_TOKEN`** needs **Checks: Read** on fine-grained PATs (for `/commits/.../check-runs`); without it the CLI falls back to PR comments/reviews only.
 
 Tune `GREPTILE_BOT_SUBSTRINGS` / `GREPTILE_CHECK_SUBSTRINGS` if your Greptile app uses different logins or check titles.
 
