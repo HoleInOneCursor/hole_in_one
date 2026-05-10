@@ -291,7 +291,10 @@ def enable_pull_request_auto_merge(
     pull_number: int,
     merge_method: str,
 ) -> None:
-    """Queue GitHub auto-merge (merges when checks/branch rules allow). Requires Pull requests: write."""
+    """Queue GitHub auto-merge (merges when checks/branch rules allow).
+
+    Fine-grained PAT: repository **Pull requests: Read and write** (GraphQL); classic: **repo** scope.
+    """
     gql_method = parse_github_auto_merge_method(merge_method)
     pr = client.get(f"/repos/{repo.owner}/{repo.name}/pulls/{pull_number}")
     pr.raise_for_status()
@@ -335,9 +338,81 @@ def wait_pull_merged(
     poll_interval_s: float,
     budget_s: float,
 ) -> bool:
-    deadline = time.monotonic() + budget_s
-    while time.monotonic() < deadline:
-        if pull_request_merged(client, repo, pull_number):
-            return True
-        time.sleep(poll_interval_s)
-    return False
+    try:
+        deadline = time.monotonic() + budget_s
+        while time.monotonic() < deadline:
+            if pull_request_merged(client, repo, pull_number):
+                return True
+            time.sleep(poll_interval_s)
+        return False
+    except KeyboardInterrupt:
+        print("\nInterrupted while waiting for PR merge.", file=sys.stderr)
+        raise SystemExit(130) from None
+
+
+def fetch_pull_merge_snapshot(client: httpx.Client, repo: Repo, pull_number: int) -> dict[str, Any]:
+    """Subset of GET pull JSON fields relevant to merging."""
+    r = client.get(f"/repos/{repo.owner}/{repo.name}/pulls/{pull_number}")
+    r.raise_for_status()
+    data = r.json()
+    return data if isinstance(data, dict) else {}
+
+
+def wait_pull_mergeable_clean(
+    client: httpx.Client,
+    repo: Repo,
+    pull_number: int,
+    *,
+    poll_interval_s: float,
+    budget_s: float,
+) -> bool:
+    """
+    Poll until GitHub reports mergeable=true and mergeable_state=clean.
+    Returns False on timeout or if merge conflicts (dirty).
+    """
+    try:
+        deadline = time.monotonic() + budget_s
+        while time.monotonic() < deadline:
+            data = fetch_pull_merge_snapshot(client, repo, pull_number)
+            if data.get("merged"):
+                return True
+            mergeable = data.get("mergeable")
+            state = str(data.get("mergeable_state") or "").lower()
+            if mergeable is False and state == "dirty":
+                print(
+                    "GitHub reports merge conflicts (mergeable_state=dirty); cannot REST-merge.",
+                    file=sys.stderr,
+                )
+                return False
+            if mergeable is True and state == "clean":
+                return True
+            time.sleep(poll_interval_s)
+        return False
+    except KeyboardInterrupt:
+        print("\nInterrupted while waiting for mergeable PR.", file=sys.stderr)
+        raise SystemExit(130) from None
+
+
+_MERGE_METHOD_REST = frozenset({"merge", "squash", "rebase"})
+
+
+def merge_pull_request_rest(
+    client: httpx.Client,
+    repo: Repo,
+    pull_number: int,
+    merge_method: str,
+) -> None:
+    """Merge immediately via REST PUT .../merge (not GraphQL auto-merge)."""
+    key = merge_method.strip().lower()
+    if key not in _MERGE_METHOD_REST:
+        raise ValueError(f"merge_method must be merge|squash|rebase, not {merge_method!r}")
+    r = client.put(
+        f"/repos/{repo.owner}/{repo.name}/pulls/{pull_number}/merge",
+        json={"merge_method": key},
+    )
+    if r.status_code == 200:
+        return
+    detail = (r.text or "").strip()
+    if len(detail) > 800:
+        detail = detail[:800] + "…"
+    raise RuntimeError(f"merge pull failed HTTP {r.status_code}: {detail or r.reason_phrase}")
