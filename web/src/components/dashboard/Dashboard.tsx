@@ -81,11 +81,23 @@ export function Dashboard() {
 
       <section className="main-grid">
         <aside className="left-column">
+          <section className="panel panel-magenta merge-panel">
+            <h3 className="panel-title">MERGE QUEUE</h3>
+            <div className="kv-grid">
+              <div>Success</div>
+              <div style={{ color: STATUS_COLORS.complete }}>{Math.round(snapshot.mergeQueue.successRate)}%</div>
+              <div>Merged</div>
+              <div style={{ color: STATUS_COLORS.complete }}>{snapshot.mergeQueue.merged}</div>
+              <div>Conflicts</div>
+              <div style={{ color: "var(--status-fix)" }}>{snapshot.mergeQueue.conflicts}</div>
+              <div>Failed</div>
+              <div style={{ color: STATUS_COLORS.failed }}>{snapshot.mergeQueue.failed}</div>
+            </div>
+          </section>
+
           <section className="panel panel-blue">
             <h3 className="panel-title">METRICS</h3>
             <div className="kv-grid">
-              <div>Iteration</div>
-              <div>{snapshot.metrics.iteration}</div>
               <div>Commits/hr</div>
               <div>{snapshot.metrics.commitsPerHour.toLocaleString()}</div>
               <div>Agents done</div>
@@ -106,20 +118,6 @@ export function Dashboard() {
               <div style={{ color: "var(--status-impl)" }}>{snapshot.metrics.implementationAgents}</div>
               <div>Fix agents</div>
               <div style={{ color: "var(--status-fix)" }}>{snapshot.metrics.fixAgents}</div>
-            </div>
-          </section>
-
-          <section className="panel panel-magenta merge-panel">
-            <h3 className="panel-title">MERGE QUEUE</h3>
-            <div className="kv-grid">
-              <div>Success</div>
-              <div style={{ color: STATUS_COLORS.complete }}>{Math.round(snapshot.mergeQueue.successRate)}%</div>
-              <div>Merged</div>
-              <div style={{ color: STATUS_COLORS.complete }}>{snapshot.mergeQueue.merged}</div>
-              <div>Conflicts</div>
-              <div style={{ color: "var(--status-fix)" }}>{snapshot.mergeQueue.conflicts}</div>
-              <div>Failed</div>
-              <div style={{ color: STATUS_COLORS.failed }}>{snapshot.mergeQueue.failed}</div>
             </div>
           </section>
         </aside>
