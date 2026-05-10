@@ -21,6 +21,7 @@ class AgentKind(str, Enum):
 class AgentNode:
     id: str
     role: str
+    task: str
     kind: AgentKind
     status: AgentStatus
     progress: int = 0

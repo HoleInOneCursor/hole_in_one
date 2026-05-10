@@ -7,6 +7,13 @@ This guide explains:
 
 The goal is to keep the UI structure exactly as-is while making backend wiring clean and low-risk.
 
+## Current status
+- `web/src/lib/dashboard/backendProvider.ts` now exists and can poll a live backend.
+- `web/src/lib/dashboard/useDashboard.ts` now supports `NEXT_PUBLIC_DASHBOARD_MODE=live`.
+- Backend FastAPI endpoints are available from the orchestrator process:
+  - `GET /api/dashboard/snapshot`
+  - `GET /api/dashboard/health`
+
 ## 1. Current architecture (today)
 
 ## Frontend entry points

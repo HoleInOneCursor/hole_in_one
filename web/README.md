@@ -12,6 +12,18 @@ npm run dev
 
 Open `http://localhost:3000`.
 
+## Live backend mode (FastAPI)
+
+```bash
+NEXT_PUBLIC_DASHBOARD_MODE=live \
+NEXT_PUBLIC_DASHBOARD_API_BASE=http://localhost:8787 \
+npm run dev
+```
+
+Expected backend endpoints:
+- `GET /api/dashboard/snapshot`
+- `GET /api/dashboard/health`
+
 ## What is implemented
 
 - Same dashboard format as the terminal version:

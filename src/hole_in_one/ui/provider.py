@@ -129,6 +129,7 @@ class MockDashboardProvider:
             AgentNode(
                 id="agent-001",
                 role="planner",
+                task="physics system coordinator",
                 kind=AgentKind.BUILDER,
                 status=AgentStatus.RUNNING,
                 progress=38,
@@ -136,6 +137,7 @@ class MockDashboardProvider:
                     AgentNode(
                         id="agent-001-sub-1",
                         role="subplanner",
+                        task="worker decomposition",
                         kind=AgentKind.IMPLEMENTATION,
                         status=AgentStatus.RUNNING,
                         progress=22,
@@ -143,6 +145,7 @@ class MockDashboardProvider:
                             AgentNode(
                                 id="agent-001-sub-1-sub-1",
                                 role="worker",
+                                task="entity collision resolution",
                                 kind=AgentKind.IMPLEMENTATION,
                                 status=AgentStatus.RUNNING,
                                 progress=13,
@@ -154,6 +157,7 @@ class MockDashboardProvider:
             AgentNode(
                 id="agent-004",
                 role="planner",
+                task="render pipeline orchestrator",
                 kind=AgentKind.IMPLEMENTATION,
                 status=AgentStatus.RUNNING,
                 progress=61,
@@ -161,6 +165,7 @@ class MockDashboardProvider:
             AgentNode(
                 id="agent-007",
                 role="planner",
+                task="repair PR conflict from Greptile",
                 kind=AgentKind.FIX,
                 status=AgentStatus.RUNNING,
                 progress=48,
@@ -168,6 +173,7 @@ class MockDashboardProvider:
             AgentNode(
                 id="agent-012",
                 role="planner",
+                task="world streaming planner",
                 kind=AgentKind.IMPLEMENTATION,
                 status=AgentStatus.RUNNING,
                 progress=74,
@@ -175,6 +181,7 @@ class MockDashboardProvider:
             AgentNode(
                 id="agent-019",
                 role="planner",
+                task="resolve flaky test failures",
                 kind=AgentKind.FIX,
                 status=AgentStatus.PENDING,
                 progress=0,
@@ -182,6 +189,7 @@ class MockDashboardProvider:
             AgentNode(
                 id="agent-024",
                 role="planner",
+                task="terrain noise generation",
                 kind=AgentKind.IMPLEMENTATION,
                 status=AgentStatus.RUNNING,
                 progress=52,
@@ -189,6 +197,7 @@ class MockDashboardProvider:
                     AgentNode(
                         id="agent-024-sub-1",
                         role="subplanner",
+                        task="camera follow smoothing",
                         kind=AgentKind.IMPLEMENTATION,
                         status=AgentStatus.RUNNING,
                         progress=36,
@@ -198,6 +207,7 @@ class MockDashboardProvider:
             AgentNode(
                 id="agent-029",
                 role="planner",
+                task="patch merge regression",
                 kind=AgentKind.FIX,
                 status=AgentStatus.RUNNING,
                 progress=29,
@@ -205,6 +215,7 @@ class MockDashboardProvider:
             AgentNode(
                 id="agent-030",
                 role="planner",
+                task="input buffer handling",
                 kind=AgentKind.IMPLEMENTATION,
                 status=AgentStatus.RUNNING,
                 progress=44,
@@ -212,6 +223,7 @@ class MockDashboardProvider:
             AgentNode(
                 id="agent-034",
                 role="planner",
+                task="repair lint/type guard breaks",
                 kind=AgentKind.FIX,
                 status=AgentStatus.FAILED,
                 progress=100,
@@ -219,6 +231,7 @@ class MockDashboardProvider:
             AgentNode(
                 id="agent-036",
                 role="planner",
+                task="animation state transitions",
                 kind=AgentKind.IMPLEMENTATION,
                 status=AgentStatus.RUNNING,
                 progress=82,
@@ -226,6 +239,7 @@ class MockDashboardProvider:
             AgentNode(
                 id="agent-038",
                 role="planner",
+                task="occlusion culling pass",
                 kind=AgentKind.IMPLEMENTATION,
                 status=AgentStatus.RUNNING,
                 progress=46,
@@ -233,6 +247,7 @@ class MockDashboardProvider:
             AgentNode(
                 id="agent-049",
                 role="planner",
+                task="fix serialization edge case",
                 kind=AgentKind.FIX,
                 status=AgentStatus.RUNNING,
                 progress=60,
@@ -246,6 +261,7 @@ class MockDashboardProvider:
                 AgentNode(
                     id=f"agent-{idx:03d}",
                     role="planner",
+                    task="implementation complete",
                     kind=AgentKind.IMPLEMENTATION,
                     status=AgentStatus.COMPLETE,
                     progress=100,
@@ -256,6 +272,7 @@ class MockDashboardProvider:
                 AgentNode(
                     id=f"agent-{idx:03d}",
                     role="planner",
+                    task="fix round complete",
                     kind=AgentKind.FIX,
                     status=AgentStatus.FAILED if idx == 34 else AgentStatus.COMPLETE,
                     progress=100,
@@ -269,6 +286,9 @@ class MockDashboardProvider:
         return AgentNode(
             id=f"agent-{base:03d}",
             role="planner",
+            task="repair PR conflict from Greptile"
+            if kind == AgentKind.FIX
+            else "iterative implementation task",
             kind=kind,
             status=AgentStatus.RUNNING,
             progress=self._rng.randint(3, 42),
