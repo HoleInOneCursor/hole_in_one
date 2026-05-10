@@ -330,6 +330,49 @@ def pull_request_merged(client: httpx.Client, repo: Repo, pull_number: int) -> b
     return bool(r.json().get("merged"))
 
 
+def fetch_pull_request_patch_bundle(
+    client: httpx.Client,
+    repo: Repo,
+    pull_number: int,
+    *,
+    max_total_chars: int = 28000,
+    per_page: int = 100,
+) -> str:
+    """Concatenate unified diffs from GET pulls/{n}/files for CLōD / tooling (truncated)."""
+    parts: list[str] = []
+    total = 0
+    page = 1
+    while True:
+        r = client.get(
+            f"/repos/{repo.owner}/{repo.name}/pulls/{pull_number}/files",
+            params={"per_page": per_page, "page": page},
+        )
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, list) or not data:
+            break
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            fn = item.get("filename") or "?"
+            status = item.get("status") or ""
+            patch = item.get("patch")
+            chunk_header = f"\n--- {fn} ({status}) ---\n"
+            chunk_body = (
+                patch if isinstance(patch, str) else "(no unified diff; binary or large file)\n"
+            )
+            chunk = chunk_header + chunk_body
+            if total + len(chunk) > max_total_chars:
+                parts.append("\n--- [truncated: remaining files omitted] ---\n")
+                return "".join(parts).strip()
+            parts.append(chunk)
+            total += len(chunk)
+        if len(data) < per_page:
+            break
+        page += 1
+    return "".join(parts).strip()
+
+
 def wait_pull_merged(
     client: httpx.Client,
     repo: Repo,
@@ -356,6 +399,55 @@ def fetch_pull_merge_snapshot(client: httpx.Client, repo: Repo, pull_number: int
     r.raise_for_status()
     data = r.json()
     return data if isinstance(data, dict) else {}
+
+
+_CLOD_VALIDATOR_SECTION_RE = re.compile(
+    r"<!--\s*hole-in-one:clod-validator\s*-->.*?<!--\s*/hole-in-one:clod-validator\s*-->",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def get_pull_request_body(client: httpx.Client, repo: Repo, pull_number: int) -> str:
+    data = fetch_pull_merge_snapshot(client, repo, pull_number)
+    b = data.get("body")
+    return b if isinstance(b, str) else ""
+
+
+def merge_clod_validator_pr_section(existing_body: str | None, section_inner_md: str) -> str:
+    """Insert or replace a marked CLōD validator section in the PR description."""
+    inner = section_inner_md.strip()
+    block = (
+        "<!-- hole-in-one:clod-validator -->\n"
+        f"{inner}\n"
+        "<!-- /hole-in-one:clod-validator -->"
+    )
+    eb = existing_body or ""
+    if _CLOD_VALIDATOR_SECTION_RE.search(eb):
+        return _CLOD_VALIDATOR_SECTION_RE.sub(block, eb, count=1).strip()
+    sep = "\n\n" if eb.strip() else ""
+    return (eb.rstrip() + sep + block).strip()
+
+
+def update_pull_request_body(client: httpx.Client, repo: Repo, pull_number: int, body: str) -> None:
+    r = client.patch(
+        f"/repos/{repo.owner}/{repo.name}/pulls/{pull_number}",
+        json={"body": body},
+    )
+    r.raise_for_status()
+
+
+def create_pull_issue_comment(
+    client: httpx.Client,
+    repo: Repo,
+    pull_number: int,
+    body: str,
+) -> None:
+    """PRs use the Issues comments endpoint (pull_number equals issue number)."""
+    r = client.post(
+        f"/repos/{repo.owner}/{repo.name}/issues/{pull_number}/comments",
+        json={"body": body},
+    )
+    r.raise_for_status()
 
 
 def wait_pull_mergeable_clean(

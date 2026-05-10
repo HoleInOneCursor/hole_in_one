@@ -13,6 +13,12 @@ from dataclasses import dataclass
 import httpx
 from dotenv import load_dotenv
 
+from hole_in_one.clod_api import (
+    DEFAULT_CLOD_BASE_URL,
+    DEFAULT_CLOD_MODEL,
+    clod_second_validator,
+    compress_greptile_feedback_for_fix,
+)
 from hole_in_one.cursor_api import (
     CursorCloudError,
     create_agent,
@@ -25,19 +31,24 @@ from hole_in_one.feedback import split_feedback
 from hole_in_one.github_api import (
     Repo,
     branch_exists,
+    create_pull_issue_comment,
     enable_pull_request_auto_merge,
+    fetch_pull_request_patch_bundle,
     find_latest_open_pr_head_ref_prefix,
     find_open_pr_for_branch,
     get_branch_tip_sha,
     get_default_branch,
     get_pr_head,
+    get_pull_request_body,
     github_client,
+    merge_clod_validator_pr_section,
     merge_pull_request_rest,
     parse_repo,
     poll_greptile_signal,
     pull_number_from_pr_url,
     pull_request_merged,
     repo_https_url,
+    update_pull_request_body,
     wait_pull_mergeable_clean,
     wait_pull_merged,
 )
@@ -53,6 +64,77 @@ DEFAULT_BUILDER_PROMPT = (
 
 def _utc_iso_z() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _greptile_plain_excerpt(raw: str, *, max_len: int = 6000) -> str:
+    """Strip HTML-ish noise for PR comments; keep Greptile context readable."""
+    if not raw.strip():
+        return "(No Greptile text was captured for this run.)"
+    t = re.sub(r"(?i)<br\s*/?>", "\n", raw)
+    t = re.sub(r"</p\s*>", "\n\n", t)
+    t = re.sub(r"<[^>]+>", "", t)
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+    if len(t) > max_len:
+        return t[:max_len].rstrip() + "\n\n_(Greptile excerpt truncated.)_"
+    return t
+
+
+def _patch_bundle_stats(patch_bundle: str) -> str:
+    if not patch_bundle.strip():
+        return "No unified diff text from GitHub for this PR (empty or binary-only files)."
+    chunks = [p for p in patch_bundle.split("\n--- ") if p.strip()]
+    n = len(chunks)
+    chars = len(patch_bundle)
+    return f"~{n} file section(s) in the patch bundle, {chars} characters (subject to CLI truncation caps)."
+
+
+def _clod_validator_pr_blurb(
+    *,
+    stamp: str,
+    verdict: str,
+    vbody: str,
+    validator_exc: BaseException | None,
+    pr_url: str,
+    pull_number: int,
+    clod_model: str,
+    greptile_raw: str,
+    patch_bundle: str,
+) -> str:
+    """Rich Markdown for PR description and timeline comment."""
+    title = "CLōD second validator"
+    head = f"{title}\n\nAutomated ({stamp}) via hole_in_one orchestrate.\n\n"
+    intro = (
+        "This is an extra review step from **CLōD** (via **hole_in_one**): it receives "
+        "Greptile’s feedback and the PR’s **unified diffs**, then decides if anything "
+        "**merge-blocking** still stands out compared with what Greptile reported.\n\n"
+        f"- **Model:** `{clod_model}`\n"
+        f"- **Pull request:** #{pull_number} — {pr_url}\n\n"
+    )
+    greptile_plain = _greptile_plain_excerpt(greptile_raw)
+    context = (
+        "### What CLōD saw\n\n"
+        f"- {_patch_bundle_stats(patch_bundle)}\n"
+        "- Greptile summary excerpt (HTML stripped):\n\n"
+        "<details>\n<summary>Greptile excerpt</summary>\n\n"
+        f"{greptile_plain}\n\n"
+        "</details>\n\n"
+    )
+    if validator_exc is not None:
+        return (
+            head
+            + intro
+            + context
+            + "### Result\n\n"
+            + "Verdict: UNKNOWN\n\n"
+            + f"The validator request failed before a model verdict:\n\n```\n{validator_exc}\n```"
+        )
+    tail = vbody.strip()
+    verdict_block = (
+        "### Verdict\n\n"
+        f"Verdict: {verdict}\n\n"
+        + ("### Model response\n\n" + tail if tail else f"VERDICT: {verdict}")
+    )
+    return head + intro + context + verdict_block
 
 
 def _greptile_indicates_no_action_needed(text: str, *, extra_substrings: list[str]) -> bool:
@@ -95,6 +177,43 @@ def _env(name: str, default: str | None = None) -> str:
 
 def _comma_list(name: str, default: str) -> list[str]:
     return [s.strip() for s in os.environ.get(name, default).split(",") if s.strip()]
+
+
+@dataclass(frozen=True)
+class ClodCompressConfig:
+    api_key: str
+    base_url: str
+    model: str
+    timeout_s: float
+    max_input_chars: int
+    max_completion_tokens: int
+
+
+def _maybe_clod_compress(raw: str, cfg: ClodCompressConfig | None) -> str:
+    """Optional CLōD rewrite for fix-agent prompts; Greptile skip heuristics use raw text only."""
+    if cfg is None or not raw.strip():
+        return raw
+    try:
+        out = compress_greptile_feedback_for_fix(
+            raw,
+            api_key=cfg.api_key,
+            base_url=cfg.base_url,
+            model=cfg.model,
+            timeout_s=cfg.timeout_s,
+            max_input_chars=cfg.max_input_chars,
+            max_completion_tokens=cfg.max_completion_tokens,
+        )
+    except Exception as exc:
+        print(
+            f"Warning: CLōD feedback compression failed; using raw Greptile text. ({exc})",
+            file=sys.stderr,
+        )
+        return raw
+    print(
+        f"CLōD: summarized Greptile feedback for fix prompt ({len(raw)} → {len(out)} chars).",
+        file=sys.stderr,
+    )
+    return out
 
 
 @dataclass(frozen=True)
@@ -400,6 +519,45 @@ def main() -> None:
     merge_poll_budget_s = float(os.environ.get("GITHUB_MERGE_POLL_BUDGET_S", "7200"))
     merge_poll_interval_s = float(os.environ.get("GITHUB_MERGE_POLL_INTERVAL_S", "15"))
 
+    def _env_truthy(name: str) -> bool:
+        return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
+
+    clod_key = os.environ.get("CLOD_API_KEY", "").strip()
+    _clod_base_raw = os.environ.get("CLOD_BASE_URL", "").strip().rstrip("/")
+    clod_shared_base = _clod_base_raw or DEFAULT_CLOD_BASE_URL
+    _clod_model_raw = os.environ.get("CLOD_MODEL", "").strip()
+    clod_shared_model = _clod_model_raw or DEFAULT_CLOD_MODEL
+
+    _compress_raw = os.environ.get("CLOD_COMPRESS_FOR_FIX", "1").strip().lower()
+    clod_compress_for_fix = _compress_raw not in ("0", "false", "no")
+
+    clod_cfg: ClodCompressConfig | None = None
+    if clod_key and clod_compress_for_fix:
+        clod_cfg = ClodCompressConfig(
+            api_key=clod_key,
+            base_url=clod_shared_base,
+            model=clod_shared_model,
+            timeout_s=float(os.environ.get("CLOD_TIMEOUT_S", "60")),
+            max_input_chars=int(os.environ.get("CLOD_MAX_INPUT_CHARS", "24000")),
+            max_completion_tokens=int(os.environ.get("CLOD_MAX_COMPLETION_TOKENS", "2048")),
+        )
+
+    clod_validator_enabled = _env_truthy("CLOD_VALIDATOR")
+    clod_validator_strict = _env_truthy("CLOD_VALIDATOR_STRICT")
+    clod_validator_max_patch_chars = int(os.environ.get("CLOD_VALIDATOR_MAX_PATCH_CHARS", "28000"))
+    clod_validator_max_greptile_chars = int(
+        os.environ.get("CLOD_VALIDATOR_MAX_GREPTILE_CHARS", "12000"),
+    )
+    clod_validator_timeout_s = float(os.environ.get("CLOD_VALIDATOR_TIMEOUT_S", "120"))
+    clod_validator_max_completion_tokens = int(
+        os.environ.get("CLOD_VALIDATOR_MAX_COMPLETION_TOKENS", "1536"),
+    )
+    clod_validator_append_pr = _env_truthy("CLOD_VALIDATOR_APPEND_PR_BODY")
+    clod_validator_comment_pr = _env_truthy("CLOD_VALIDATOR_COMMENT_PR")
+
+    if clod_validator_enabled and not clod_key:
+        raise SystemExit("CLOD_VALIDATOR=1 requires CLOD_API_KEY.")
+
     queue_auto_merge = bool(github_auto_merge) and not github_merge_immediate
     if github_auto_merge and github_merge_immediate:
         print(
@@ -415,6 +573,14 @@ def main() -> None:
         extra_banner.append(f"merge-immediate={github_merge_immediate}")
     if github_merge_on_clean:
         extra_banner.append(f"merge-on-greptile-clean={github_merge_on_clean}")
+    if clod_cfg:
+        extra_banner.append(f"clod=model:{clod_cfg.model}")
+    if clod_validator_enabled:
+        extra_banner.append(f"clod-validator={'strict' if clod_validator_strict else 'warn'}")
+        if clod_validator_append_pr:
+            extra_banner.append("clod-pr-append")
+        if clod_validator_comment_pr:
+            extra_banner.append("clod-pr-comment")
 
     print(
         f"Repo {repo_full} | new agent per Greptile fix | "
@@ -615,7 +781,10 @@ def main() -> None:
                 except Exception as exc:
                     graphql_auto_merge_failed = True
                     print(f"Warning: could not enable auto-merge: {exc}", file=sys.stderr)
-                    low = str(exc).lower()
+                    raw = str(exc)
+                    gql_prefix = "enablePullRequestAutoMerge failed: "
+                    msg_body = raw[len(gql_prefix) :] if raw.startswith(gql_prefix) else raw
+                    low = msg_body.lower()
                     if (
                         "personal access token" in low
                         or "resource not accessible" in low
@@ -631,11 +800,27 @@ def main() -> None:
                             "GraphQL queue-only auto-merge.",
                             file=sys.stderr,
                         )
-                    elif "auto merge" in low or "automerge" in low or "workflow" in low:
+                    elif "clean status" in low:
+                        print(
+                            "Hint: GitHub sometimes rejects queueing auto-merge when the PR is already "
+                            "mergeable (mergeable_state=clean), e.g. branch protection has no **required** "
+                            "status checks — auto-merge is for waiting on checks. Use a direct merge "
+                            "(this CLI’s REST fallback after Greptile, or merge in the UI). "
+                            "Add required checks on the base branch if you want true auto-merge queueing.",
+                            file=sys.stderr,
+                        )
+                    elif (
+                        "auto merge" in low
+                        or "automerge" in low
+                        or "workflow" in low
+                        or "merge queue" in low
+                        or "branch protection" in low
+                    ):
                         print(
                             "Hint: Confirm the repository has **Allow auto-merge** enabled "
-                            "(Settings → General → Pull Requests) and branch protection allows "
-                            "the merge method you chose.",
+                            "(Settings → General → Pull Requests), branch protection allows "
+                            "the merge method you chose, and required checks/reviews match what "
+                            "you expect.",
                             file=sys.stderr,
                         )
 
@@ -685,18 +870,20 @@ def main() -> None:
                     head_sha_before_fix, _ = get_pr_head(gh, repo, pull_number)
                     round_started_iso = _utc_iso_z()
 
+                    fix_prompt_feedback = _maybe_clod_compress(feedback_text, clod_cfg)
+
                     if max_parallel_fixers <= 1:
                         _run_single_fix_agent(
                             api_key,
                             pr_url=pr_url,
                             pull_number=pull_number,
                             pr_head_ref=pr_head_ref_for_fix,
-                            feedback_text=feedback_text,
+                            feedback_text=fix_prompt_feedback,
                             model_id=model_id,
                             stop_mode=stop_mode,
                         )
                     else:
-                        chunks = split_feedback(feedback_text, max_feedback_chunks)
+                        chunks = split_feedback(fix_prompt_feedback, max_feedback_chunks)
                         _parallel_fix_agents(
                             api_key,
                             pr_url=pr_url,
@@ -745,6 +932,102 @@ def main() -> None:
                     feedback_text = joined
 
             print("\nDone. PR:", pr_url)
+
+            if clod_validator_enabled:
+                print("\n=== CLōD second validator ===")
+                verdict = "UNKNOWN"
+                vbody = ""
+                patch_bundle = ""
+                validator_exc: BaseException | None = None
+                try:
+                    patch_bundle = fetch_pull_request_patch_bundle(
+                        gh,
+                        repo,
+                        pull_number,
+                        max_total_chars=clod_validator_max_patch_chars,
+                    )
+                    verdict, vbody = clod_second_validator(
+                        greptile_summary=feedback_text,
+                        patch_bundle=patch_bundle,
+                        api_key=clod_key,
+                        base_url=clod_shared_base,
+                        model=clod_shared_model,
+                        timeout_s=clod_validator_timeout_s,
+                        max_completion_tokens=clod_validator_max_completion_tokens,
+                        max_greptile_chars=clod_validator_max_greptile_chars,
+                        max_patch_chars=clod_validator_max_patch_chars,
+                    )
+                except Exception as exc:
+                    validator_exc = exc
+                    print(
+                        f"Warning: CLōD validator failed ({exc}); verdict UNKNOWN (non-blocking).",
+                        file=sys.stderr,
+                    )
+
+                print(f"CLōD validator verdict: {verdict}")
+                if vbody.strip():
+                    print(vbody[:8000])
+
+                if clod_validator_append_pr or clod_validator_comment_pr:
+                    stamp = _utc_iso_z()
+                    inner = _clod_validator_pr_blurb(
+                        stamp=stamp,
+                        verdict=verdict,
+                        vbody=vbody,
+                        validator_exc=validator_exc,
+                        pr_url=pr_url,
+                        pull_number=pull_number,
+                        clod_model=clod_shared_model,
+                        greptile_raw=feedback_text,
+                        patch_bundle=patch_bundle,
+                    )
+                    append_cap = int(os.environ.get("CLOD_VALIDATOR_PR_MAX_CHARS", "45000"))
+                    if len(inner) > append_cap:
+                        inner = inner[:append_cap] + "\n\n_(truncated)_"
+                    try:
+                        if clod_validator_append_pr:
+                            cur_body = get_pull_request_body(gh, repo, pull_number)
+                            merged = merge_clod_validator_pr_section(cur_body, inner)
+                            update_pull_request_body(gh, repo, pull_number, merged)
+                            print(
+                                "Updated PR description with CLōD validator section.",
+                                file=sys.stderr,
+                            )
+                        if clod_validator_comment_pr:
+                            comment_body = _clod_validator_pr_blurb(
+                                stamp=stamp,
+                                verdict=verdict,
+                                vbody=vbody,
+                                validator_exc=validator_exc,
+                                pr_url=pr_url,
+                                pull_number=pull_number,
+                                clod_model=clod_shared_model,
+                                greptile_raw=feedback_text,
+                                patch_bundle=patch_bundle,
+                            )
+                            comment_cap = 65000
+                            if len(comment_body) > comment_cap:
+                                comment_body = comment_body[:comment_cap] + "\n\n_(truncated)_"
+                            create_pull_issue_comment(gh, repo, pull_number, comment_body)
+                            print(
+                                "Posted CLōD validator as a PR comment.",
+                                file=sys.stderr,
+                            )
+                    except Exception as exc:
+                        print(
+                            f"Warning: could not publish CLōD validator to GitHub ({exc}).",
+                            file=sys.stderr,
+                        )
+
+                if clod_validator_strict and verdict == "FAIL":
+                    print(
+                        "CLōD validator STRICT: FAIL — stopping before REST merge / merge wait. "
+                        "Note: GraphQL auto-merge may already be queued (GITHUB_AUTO_MERGE).",
+                        file=sys.stderr,
+                    )
+                    if continuous:
+                        break
+                    sys.exit(1)
 
             rest_merge_method: str | None = github_merge_immediate
             rest_merge_label = "GITHUB_MERGE_IMMEDIATE"

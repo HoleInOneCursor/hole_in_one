@@ -64,6 +64,8 @@ python -m hole_in_one.orchestrate --help
 
 Prerequisites: Greptile GitHub app on the repo; Cursor Cloud connected to that repo; optional `triggerOnUpdates` in `greptile.json` so re-review runs after pushes. **`GITHUB_TOKEN`** needs **Checks: Read** on fine-grained PATs (for `/commits/.../check-runs`); without it the CLI falls back to PR comments/reviews only.
 
+Optional **[CLōD](https://clod.io/)** ([API docs](https://clod.io/docs)): set **`CLOD_API_KEY`** for **`POST .../chat/completions`**. With **`CLOD_COMPRESS_FOR_FIX=1`** (default), Greptile feedback is summarized before each Cursor **fix** agent; clean/skip heuristics still use **raw** Greptile text. With **`CLOD_VALIDATOR=1`**, a **second pass** sends Greptile summary plus PR **unified diffs** to CLōD and expects **`VERDICT: PASS`** or **`FAIL`**; **`CLOD_VALIDATOR_APPEND_PR_BODY=1`** updates the PR description inside a marked HTML block (plain-text title **CLōD second validator**, then **Automated (UTC)** / **Verdict:** lines and model output—replaced on re-run), and **`CLOD_VALIDATOR_COMMENT_PR=1`** posts the same blurb as a timeline comment (**`GITHUB_TOKEN`** needs permission to edit the PR / create issue comments). **`CLOD_VALIDATOR_STRICT=1`** aborts before REST merge on **`FAIL`** (**`UNKNOWN`** never blocks). GraphQL auto-merge may already be queued earlier—see `.env.example`.
+
 If **`GITHUB_DEFAULT_BRANCH`** is unset, the CLI loads the repo’s **GitHub default branch** via the API (not hard-coded `main`). **`CURSOR_STARTING_REF_REFS_FIRST`** / **`CURSOR_TRY_COMMIT_SHA_FOR_STARTING_REF`** retry Cursor `startingRef` when branch validation flakes.
 
 Tune `GREPTILE_BOT_SUBSTRINGS` / `GREPTILE_CHECK_SUBSTRINGS` if your Greptile app uses different logins or check titles.
@@ -73,6 +75,7 @@ Tune `GREPTILE_BOT_SUBSTRINGS` / `GREPTILE_CHECK_SUBSTRINGS` if your Greptile ap
 | Module | Role |
 | --- | --- |
 | `src/hole_in_one/orchestrate.py` | Backend orchestration loop |
+| `src/hole_in_one/clod_api.py` | Optional CLōD chat summarization for fix prompts |
 | `web/src/lib/dashboard/mockProvider.ts` | Mock dashboard provider + simulation |
 | `web/src/lib/dashboard/types.ts` | Dashboard view models/types |
 | `web/src/components/dashboard/Dashboard.tsx` | Main web dashboard layout |
