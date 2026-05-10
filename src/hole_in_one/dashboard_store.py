@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
+from collections.abc import Sequence
 from dataclasses import replace
 from datetime import timedelta
 
@@ -45,6 +46,8 @@ class DashboardStore:
         self._activity: deque[str] = deque(maxlen=max(40, activity_limit))
         self._in_progress: list[AgentNode] = []
         self._completed: list[AgentNode] = []
+        self._planner_tasks: tuple[str, ...] = ()
+        self._planner_task_index: int = -1
 
         self.record_activity("boot", "live dashboard store initialized")
 
@@ -76,6 +79,15 @@ class DashboardStore:
     def set_agents_total(self, total: int) -> None:
         with self._lock:
             self._agents_total = max(1, total)
+
+    def set_planner_tasks(self, tasks: Sequence[str], *, current_index: int = 0) -> None:
+        """Expose CLōD split builder prompts and which step is running (for web dashboard)."""
+        with self._lock:
+            self._planner_tasks = tuple(str(t) for t in tasks)
+            if not self._planner_tasks:
+                self._planner_task_index = -1
+            else:
+                self._planner_task_index = max(0, min(current_index, len(self._planner_tasks) - 1))
 
     def add_or_update_root_agent(
         self,
@@ -220,6 +232,8 @@ class DashboardStore:
                 activity_lines=activity_lines,
                 feature_progress=feature_progress,
                 controls_hint=self._controls_hint,
+                planner_tasks=self._planner_tasks,
+                planner_task_index=self._planner_task_index,
             )
 
     def _find_root_index(self, roots: list[AgentNode], agent_id: str) -> int | None:

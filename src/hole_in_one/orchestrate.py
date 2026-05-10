@@ -649,7 +649,8 @@ def main() -> None:
             raise SystemExit("CLOD_PLANNER/--plan requires CLOD_API_KEY.")
         planner_max = max(1, min(12, int(os.environ.get("CLOD_PLANNER_MAX_TASKS", "6"))))
         planner_timeout_s = float(os.environ.get("CLOD_PLANNER_TIMEOUT_S", "120"))
-        planner_tokens = int(os.environ.get("CLOD_PLANNER_MAX_COMPLETION_TOKENS", "2048"))
+        # Planner JSON must fit every task string; 2048 tokens often truncates multi-step plans.
+        planner_tokens = int(os.environ.get("CLOD_PLANNER_MAX_COMPLETION_TOKENS", "8192"))
         print("\n=== CLōD planner (split goal into sequential builders) ===", flush=True)
         try:
             builder_prompts = plan_builder_tasks(
@@ -731,6 +732,8 @@ def main() -> None:
             dashboard_api = None
             dashboard_store.record_activity("failed", f"dashboard API start failed: {exc}")
             print(f"Warning: could not start dashboard API: {exc}", file=sys.stderr)
+        if dashboard_store is not None:
+            dashboard_store.set_planner_tasks(builder_prompts, current_index=0)
 
     print(
         f"Repo {repo_full} | builder_tasks={len(builder_prompts)} | new agent per Greptile fix | "
@@ -779,6 +782,8 @@ def main() -> None:
                 )
 
             for _task_i, builder_prompt in enumerate(builder_prompts):
+                if dashboard_store is not None:
+                    dashboard_store.set_planner_tasks(builder_prompts, current_index=_task_i)
                 if len(builder_prompts) > 1:
                     print(f"\n=== Builder task {_task_i + 1}/{len(builder_prompts)} ===", flush=True)
                 full_builder_prompt = (

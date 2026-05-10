@@ -87,6 +87,8 @@ class MockDashboardProvider:
             activity_lines=list(self._activity),
             feature_progress=feature,
             controls_hint="mock mode | tab=agent-grid/activity/graph | q=quit",
+            planner_tasks=(),
+            planner_task_index=-1,
         )
 
     def _tick(self) -> None:

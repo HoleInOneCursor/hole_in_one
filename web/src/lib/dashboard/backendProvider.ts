@@ -16,7 +16,14 @@ function assertSnapshotShape(value: unknown): DashboardSnapshot {
   if (!candidate.projectName || !candidate.metrics || !candidate.mergeQueue) {
     throw new Error("dashboard snapshot payload is missing required fields");
   }
-  return candidate as DashboardSnapshot;
+  const plannerTasks = Array.isArray(candidate.plannerTasks)
+    ? candidate.plannerTasks.filter((t): t is string => typeof t === "string")
+    : [];
+  const plannerTaskIndex =
+    typeof candidate.plannerTaskIndex === "number" && Number.isFinite(candidate.plannerTaskIndex)
+      ? candidate.plannerTaskIndex
+      : -1;
+  return { ...candidate, plannerTasks, plannerTaskIndex } as DashboardSnapshot;
 }
 
 export class BackendDashboardProvider {
@@ -113,6 +120,8 @@ export class BackendDashboardProvider {
         total: 100,
       },
       controlsHint: `live mode | backend unreachable (${this.apiBase}) | retrying`,
+      plannerTasks: [],
+      plannerTaskIndex: -1,
     };
   }
 }

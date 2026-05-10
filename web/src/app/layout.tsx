@@ -1,23 +1,24 @@
 import type { Metadata } from "next";
-import { Chakra_Petch, Share_Tech_Mono } from "next/font/google";
+import { Inter, JetBrains_Mono } from "next/font/google";
 
 import "./globals.css";
 
-const mono = Share_Tech_Mono({
-  variable: "--font-mono",
-  weight: "400",
+const sans = Inter({
+  variable: "--font-sans",
   subsets: ["latin"],
+  display: "swap",
 });
 
-const display = Chakra_Petch({
-  variable: "--font-display",
-  weight: ["500", "600"],
+const mono = JetBrains_Mono({
+  variable: "--font-mono",
   subsets: ["latin"],
+  weight: ["400", "500"],
+  display: "swap",
 });
 
 export const metadata: Metadata = {
-  title: "Hole In Golf Dashboard",
-  description: "Frontend visualizer for Hole In Golf agent orchestration.",
+  title: "Agent dashboard",
+  description: "Orchestration dashboard — Cursor-styled agent grid and activity.",
 };
 
 export default function RootLayout({
@@ -26,7 +27,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" className={`${mono.variable} ${display.variable}`}>
+    <html lang="en" className={`${sans.variable} ${mono.variable}`}>
       <body>{children}</body>
     </html>
   );

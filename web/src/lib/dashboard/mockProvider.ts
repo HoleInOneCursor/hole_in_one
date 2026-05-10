@@ -144,6 +144,16 @@ export class MockDashboardProvider {
       total: this.agentsTotal,
     };
 
+    const plannerTasks = [
+      "Scaffold API + types for the feature",
+      "Implement core logic and tests",
+      "Wire UI and run integration checks",
+    ];
+    const plannerTaskIndex = Math.min(
+      plannerTasks.length - 1,
+      Math.floor(this.iteration / 80),
+    );
+
     return {
       projectName: "HOLE IN GOLF",
       uptime: formatUptime(Date.now() - this.startedAt),
@@ -156,6 +166,8 @@ export class MockDashboardProvider {
       activityLines: [...this.activity],
       featureProgress,
       controlsHint: "mock mode | tab=agent-grid/activity/graph",
+      plannerTasks,
+      plannerTaskIndex,
     };
   }
 

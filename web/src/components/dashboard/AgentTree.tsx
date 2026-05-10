@@ -54,7 +54,7 @@ export function AgentTree({ title, nodes, onNodeHover, onNodeLeave }: AgentTreeP
   const rows = toRows(nodes);
 
   return (
-    <section className="panel panel-green agent-tree-panel">
+    <section className="panel panel-secondary agent-tree-panel">
       <h3 className="panel-title">{title}</h3>
       <div className="agent-tree-scroll">
         {rows.map(({ node, branch, key }) => {
