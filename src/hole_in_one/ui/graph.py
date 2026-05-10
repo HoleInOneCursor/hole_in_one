@@ -46,7 +46,7 @@ class AgentGraphWidget(Static):
         self._center_pull = 0.008
 
     def on_mount(self) -> None:
-        self.set_interval(self.tick_s, self._animate)
+        self.set_interval(self.tick_s, self._tick_graph)
         self.update("[#6b7d8a]Waiting for agent data...[/]")
 
     def sync_agents(self, roots: list[AgentNode]) -> None:
@@ -125,7 +125,7 @@ class AgentGraphWidget(Static):
             base += min(1.3, 0.3 * child_count)
         return base
 
-    def _animate(self) -> None:
+    def _tick_graph(self) -> None:
         if not self._sim_nodes:
             self.update("[#6b7d8a]No in-progress agents yet.[/]", layout=False)
             return

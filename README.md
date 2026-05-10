@@ -2,36 +2,37 @@
 
 **Theme:** *Build Something Agents Want* — a minimal loop where **Cursor cloud agents** ship a PR, **Greptile** reviews it, and agents apply follow-up commits.
 
-Stack: **Python**, **httpx**, **Textual**, and the [Cursor Cloud Agents HTTP API](https://cursor.com/docs/cloud-agent/api/endpoints.md) (no TypeScript SDK).
+Stack: **Python**, **httpx**, and **Next.js**.
 
-This repo now has a frontend-first terminal dashboard entrypoint:
-- Default CLI mode opens the TUI visualizer (`orchestrate` or `hole-in-golf`).
-- Backend orchestration loop is still available via explicit `backend` mode.
-- TUI tabs: `Agent Grid`, `Activity`, and live `Graph`.
-- Current dashboard is intentionally mock-data driven (no backend wiring yet) so integration is straightforward when APIs stabilize.
+This repo now has a frontend-first **web dashboard**:
+- Next.js app in `web/`
+- Tabs: `Agent Grid`, `Activity`, `Graph`
+- Graph is a browser-native animated node/edge visualization
+- Current web dashboard is intentionally mock-data driven (no backend wiring yet)
 
-## What you demo
+A legacy Textual terminal dashboard still exists in the Python package, but the web UI is now the primary frontend.
 
-1. A **builder** cloud agent opens a PR on `GITHUB_REPO` (`POST /v1/agents` with `autoCreatePR`).
-2. The builder is **stopped** (`CURSOR_STOP_AGENT`, default `archive`) once the PR is resolved.
-3. Greptile reviews the PR; this CLI polls GitHub for checks/comments.
-4. Each fix round starts a **new** cloud agent scoped to that PR (`repos[0].prUrl`), then stops it when the run finishes. Use `MAX_PARALLEL_FIXERS=2` only if you accept possible branch contention.
+## Quick start (web dashboard)
 
-## Quick start
+```bash
+cd web
+npm install
+npm run dev
+```
+
+Open `http://localhost:3000`.
+
+## Quick start (backend loop)
 
 ```bash
 python3 -m venv .venv
-source .venv/bin/activate   # or .venv\Scripts\activate on Windows
+source .venv/bin/activate
 pip install -e .
 
 cp .env.example .env
 # fill CURSOR_API_KEY, GITHUB_TOKEN, GITHUB_REPO
 
-# open terminal dashboard (default mode)
-orchestrate
-# or: hole-in-golf
-
-# run legacy backend loop
+# run backend orchestration loop
 orchestrate backend
 # or: orchestrate-loop
 ```
@@ -44,11 +45,9 @@ Tune `GREPTILE_BOT_SUBSTRINGS` / `GREPTILE_CHECK_SUBSTRINGS` if your Greptile ap
 
 | Module | Role |
 | --- | --- |
-| `hole_in_one/cursor_api.py` | Cursor REST: create agent, runs, wait |
-| `hole_in_one/github_api.py` | Greptile heuristics via GitHub REST |
-| `hole_in_one/feedback.py` | Chunk markdown for parallel mode |
-| `hole_in_one/orchestrate.py` | Backend orchestration loop |
-| `hole_in_one/cli.py` | CLI entrypoint (`ui` default, `backend` optional) |
-| `hole_in_one/ui/models.py` | Dashboard view models |
-| `hole_in_one/ui/provider.py` | Provider interface + mock provider |
-| `hole_in_one/ui/app.py` | Textual terminal dashboard |
+| `src/hole_in_one/orchestrate.py` | Backend orchestration loop |
+| `web/src/lib/dashboard/mockProvider.ts` | Mock dashboard provider + simulation |
+| `web/src/lib/dashboard/types.ts` | Dashboard view models/types |
+| `web/src/components/dashboard/Dashboard.tsx` | Main web dashboard layout |
+| `web/src/components/dashboard/ForceGraph.tsx` | Animated graph tab visualization |
+| `web/src/components/dashboard/AgentTree.tsx` | In-progress/completed tree panels |
