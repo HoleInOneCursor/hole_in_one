@@ -194,6 +194,7 @@ body {
   white-space: nowrap;
   font-size: 0.91rem;
   line-height: 1.45;
+  cursor: help;
 }
 
 .branch {
@@ -276,6 +277,40 @@ body {
   justify-content: space-between;
   gap: 12px;
   padding: 9px 12px 11px;
+  font-size: 0.9rem;
+}
+
+.agent-hover-card {
+  position: fixed;
+  z-index: 100;
+  width: 280px;
+  pointer-events: none;
+  border: 1px solid rgba(56, 161, 208, 0.9);
+  border-radius: 6px;
+  background: linear-gradient(180deg, rgba(4, 14, 27, 0.97), rgba(2, 10, 19, 0.97));
+  box-shadow: 0 18px 45px rgba(0, 0, 0, 0.45);
+  padding: 8px 10px;
+}
+
+.hover-id {
+  color: #dff0fb;
+  font-family: var(--font-display), sans-serif;
+  letter-spacing: 0.3px;
+  font-size: 0.96rem;
+}
+
+.hover-line {
+  margin-top: 6px;
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  color: #9eb4c4;
+  font-size: 0.86rem;
+}
+
+.hover-task {
+  margin-top: 6px;
+  color: #c4d7e5;
   font-size: 0.9rem;
 }
 

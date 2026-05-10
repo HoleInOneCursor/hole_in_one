@@ -4,10 +4,20 @@ export type AgentKind = "builder" | "implementation" | "fix";
 export type AgentNode = {
   id: string;
   role: string;
+  task: string;
   kind: AgentKind;
   status: AgentStatus;
   progress: number;
   children: AgentNode[];
+};
+
+export type AgentHoverDetails = {
+  id: string;
+  role: string;
+  task: string;
+  kind: AgentKind;
+  status: AgentStatus;
+  progress: number;
 };
 
 export type MetricsSnapshot = {

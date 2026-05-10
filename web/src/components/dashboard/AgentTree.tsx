@@ -1,27 +1,46 @@
-import { KIND_COLORS, STATUS_COLORS, type AgentNode } from "@/lib/dashboard/types";
+import {
+  KIND_COLORS,
+  STATUS_COLORS,
+  type AgentHoverDetails,
+  type AgentNode,
+} from "@/lib/dashboard/types";
+
+type Point = {
+  x: number;
+  y: number;
+};
 
 type TreeRow = {
   node: AgentNode;
-  depth: number;
+  key: string;
   branch: string;
+};
+
+type AgentTreeProps = {
+  title: string;
+  nodes: AgentNode[];
+  onNodeHover?: (node: AgentHoverDetails, point: Point) => void;
+  onNodeLeave?: () => void;
 };
 
 function toRows(nodes: AgentNode[]): TreeRow[] {
   const rows: TreeRow[] = [];
 
-  const walk = (list: AgentNode[], depth: number, prefix: string) => {
+  const walk = (list: AgentNode[], depth: number, prefix: string, lineage: string) => {
     list.forEach((node, index) => {
       const isLast = index === list.length - 1;
       const branch = `${prefix}${depth === 0 ? "" : isLast ? "└─ " : "├─ "}`;
-      rows.push({ node, depth, branch });
+      const rowKey = lineage ? `${lineage}.${index}` : `${index}`;
+      rows.push({ node, key: `${rowKey}-${node.id}`, branch });
+
       const nextPrefix = `${prefix}${depth === 0 ? "" : isLast ? "   " : "│  "}`;
       if (node.children.length > 0) {
-        walk(node.children, depth + 1, nextPrefix);
+        walk(node.children, depth + 1, nextPrefix, rowKey);
       }
     });
   };
 
-  walk(nodes, 0, "");
+  walk(nodes, 0, "", "");
   return rows;
 }
 
@@ -31,17 +50,28 @@ function kindGlyph(kind: AgentNode["kind"]): string {
   return "●";
 }
 
-export function AgentTree({ title, nodes }: { title: string; nodes: AgentNode[] }) {
+export function AgentTree({ title, nodes, onNodeHover, onNodeLeave }: AgentTreeProps) {
   const rows = toRows(nodes);
 
   return (
     <section className="panel panel-green agent-tree-panel">
       <h3 className="panel-title">{title}</h3>
       <div className="agent-tree-scroll">
-        {rows.map(({ node, branch }) => {
+        {rows.map(({ node, branch, key }) => {
           const statusColor = STATUS_COLORS[node.status];
           return (
-            <div className="agent-row" key={node.id}>
+            <div
+              className="agent-row"
+              key={key}
+              onMouseEnter={(event) =>
+                onNodeHover?.(node, { x: event.clientX, y: event.clientY })
+              }
+              onMouseMove={(event) =>
+                onNodeHover?.(node, { x: event.clientX, y: event.clientY })
+              }
+              onMouseLeave={onNodeLeave}
+              title={`${node.id} • ${node.task}`}
+            >
               <span className="branch">{branch}</span>
               <span style={{ color: statusColor }}>■■■</span>
               <span className="agent-id"> {node.id}</span>

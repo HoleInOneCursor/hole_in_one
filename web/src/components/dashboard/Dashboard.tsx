@@ -5,9 +5,19 @@ import { useMemo, useState } from "react";
 import { AgentTree } from "@/components/dashboard/AgentTree";
 import { ForceGraph } from "@/components/dashboard/ForceGraph";
 import { useDashboard } from "@/lib/dashboard/useDashboard";
-import { STATUS_COLORS, type AgentNode } from "@/lib/dashboard/types";
+import {
+  STATUS_COLORS,
+  type AgentHoverDetails,
+  type AgentNode,
+} from "@/lib/dashboard/types";
 
 type TabKey = "agent-grid" | "activity" | "graph";
+
+type HoverCard = {
+  node: AgentHoverDetails;
+  x: number;
+  y: number;
+};
 
 function flattenNodes(roots: AgentNode[]): AgentNode[] {
   const out: AgentNode[] = [];
@@ -32,11 +42,27 @@ function statusTone(line: string): string {
 export function Dashboard() {
   const snapshot = useDashboard(1000);
   const [tab, setTab] = useState<TabKey>("agent-grid");
+  const [hoverCard, setHoverCard] = useState<HoverCard | null>(null);
 
   const featurePercent = useMemo(() => {
     if (!snapshot) return 0;
     return Math.round((snapshot.featureProgress.done / Math.max(1, snapshot.featureProgress.total)) * 100);
   }, [snapshot]);
+
+  const tooltipPosition = useMemo(() => {
+    if (!hoverCard) return null;
+
+    const width = 280;
+    const height = 134;
+    if (typeof window === "undefined") {
+      return { left: hoverCard.x + 14, top: hoverCard.y + 14 };
+    }
+
+    return {
+      left: Math.max(8, Math.min(window.innerWidth - width - 8, hoverCard.x + 14)),
+      top: Math.max(8, Math.min(window.innerHeight - height - 8, hoverCard.y + 14)),
+    };
+  }, [hoverCard]);
 
   if (!snapshot) {
     return <div className="dashboard-loading">Loading dashboard…</div>;
@@ -102,19 +128,28 @@ export function Dashboard() {
           <div className="tabs-row">
             <button
               className={`tab-btn ${tab === "agent-grid" ? "active" : ""}`}
-              onClick={() => setTab("agent-grid")}
+              onClick={() => {
+                setHoverCard(null);
+                setTab("agent-grid");
+              }}
             >
               Agent Grid
             </button>
             <button
               className={`tab-btn ${tab === "activity" ? "active" : ""}`}
-              onClick={() => setTab("activity")}
+              onClick={() => {
+                setHoverCard(null);
+                setTab("activity");
+              }}
             >
               Activity
             </button>
             <button
               className={`tab-btn ${tab === "graph" ? "active" : ""}`}
-              onClick={() => setTab("graph")}
+              onClick={() => {
+                setHoverCard(null);
+                setTab("graph");
+              }}
             >
               Graph
             </button>
@@ -123,8 +158,18 @@ export function Dashboard() {
           {tab === "agent-grid" ? (
             <>
               <div className="tree-columns">
-                <AgentTree title="In Progress" nodes={snapshot.inProgress} />
-                <AgentTree title="Completed" nodes={snapshot.completed} />
+                <AgentTree
+                  title="In Progress"
+                  nodes={snapshot.inProgress}
+                  onNodeHover={(node, point) => setHoverCard({ node, x: point.x, y: point.y })}
+                  onNodeLeave={() => setHoverCard(null)}
+                />
+                <AgentTree
+                  title="Completed"
+                  nodes={snapshot.completed}
+                  onNodeHover={(node, point) => setHoverCard({ node, x: point.x, y: point.y })}
+                  onNodeLeave={() => setHoverCard(null)}
+                />
               </div>
               <section className="panel panel-green activity-slice">
                 <h3 className="panel-title">Activity</h3>
@@ -155,7 +200,11 @@ export function Dashboard() {
           {tab === "graph" ? (
             <section className="panel panel-green graph-panel">
               <h3 className="panel-title">Agent Flow Graph</h3>
-              <ForceGraph roots={snapshot.inProgress} />
+              <ForceGraph
+                roots={snapshot.inProgress}
+                onNodeHover={(node, point) => setHoverCard({ node, x: point.x, y: point.y })}
+                onNodeLeave={() => setHoverCard(null)}
+              />
               <div className="graph-legend">
                 <span>
                   <strong>Shapes:</strong> builder circle, implementation circle, fix triangle
@@ -184,6 +233,21 @@ export function Dashboard() {
         </section>
         <section className="panel panel-cyan controls">{snapshot.controlsHint}</section>
       </footer>
+
+      {hoverCard && tooltipPosition ? (
+        <aside className="agent-hover-card" style={tooltipPosition}>
+          <div className="hover-id">{hoverCard.node.id}</div>
+          <div className="hover-line">
+            <span>{hoverCard.node.role}</span>
+            <span>{hoverCard.node.kind}</span>
+          </div>
+          <div className="hover-task">{hoverCard.node.task}</div>
+          <div className="hover-line">
+            <span style={{ color: STATUS_COLORS[hoverCard.node.status] }}>{hoverCard.node.status}</span>
+            <span>{hoverCard.node.progress}%</span>
+          </div>
+        </aside>
+      ) : null}
     </main>
   );
 }

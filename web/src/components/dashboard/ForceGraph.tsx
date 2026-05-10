@@ -2,12 +2,32 @@
 
 import { useEffect, useRef, useState } from "react";
 
-import { STATUS_COLORS, type AgentKind, type AgentNode, type AgentStatus } from "@/lib/dashboard/types";
+import {
+  STATUS_COLORS,
+  type AgentHoverDetails,
+  type AgentKind,
+  type AgentNode,
+  type AgentStatus,
+} from "@/lib/dashboard/types";
+
+type Point = {
+  x: number;
+  y: number;
+};
+
+type ForceGraphProps = {
+  roots: AgentNode[];
+  onNodeHover?: (node: AgentHoverDetails, point: Point) => void;
+  onNodeLeave?: () => void;
+};
 
 type FrameNode = {
   id: string;
+  role: string;
+  task: string;
   kind: AgentKind;
   status: AgentStatus;
+  progress: number;
   childCount: number;
 };
 
@@ -66,8 +86,11 @@ function flatten(roots: AgentNode[]): {
   const walk = (node: AgentNode, parentId?: string) => {
     nodes.set(node.id, {
       id: node.id,
+      role: node.role,
+      task: node.task,
       kind: node.kind,
       status: node.status,
+      progress: node.progress,
       childCount: node.children.length,
     });
 
@@ -122,7 +145,7 @@ function buildRenderData(sim: SimulationState): RenderData {
   return { nodes, edges };
 }
 
-export function ForceGraph({ roots }: { roots: AgentNode[] }) {
+export function ForceGraph({ roots, onNodeHover, onNodeLeave }: ForceGraphProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const simRef = useRef<SimulationState>({ nodes: new Map(), edges: [] });
   const [size, setSize] = useState({ width: 800, height: 440 });
@@ -154,8 +177,11 @@ export function ForceGraph({ roots }: { roots: AgentNode[] }) {
     for (const [id, node] of frameNodes) {
       const existing = sim.nodes.get(id);
       if (existing) {
+        existing.role = node.role;
+        existing.task = node.task;
         existing.kind = node.kind;
         existing.status = node.status;
+        existing.progress = node.progress;
         existing.childCount = node.childCount;
         existing.radius = nodeRadius(node.kind, node.childCount);
         continue;
@@ -322,9 +348,27 @@ export function ForceGraph({ roots }: { roots: AgentNode[] }) {
         {renderData.nodes.map((node) => {
           const color = STATUS_COLORS[node.status];
           const labelVisible = node.kind === "builder" || node.childCount > 0;
+          const hoverPayload: AgentHoverDetails = {
+            id: node.id,
+            role: node.role,
+            task: node.task,
+            kind: node.kind,
+            status: node.status,
+            progress: node.progress,
+          };
 
           return (
-            <g key={node.id}>
+            <g
+              key={node.id}
+              onMouseEnter={(event) =>
+                onNodeHover?.(hoverPayload, { x: event.clientX, y: event.clientY })
+              }
+              onMouseMove={(event) =>
+                onNodeHover?.(hoverPayload, { x: event.clientX, y: event.clientY })
+              }
+              onMouseLeave={onNodeLeave}
+              style={{ cursor: "crosshair" }}
+            >
               {node.kind === "fix" ? (
                 <polygon
                   points={trianglePoints(node.x, node.y, node.radius)}
