@@ -147,6 +147,7 @@ class HoleInGolfDashboard(App[None]):
         self.provider = provider or MockDashboardProvider()
         self.refresh_interval = refresh_interval
         self._last_activity_count = 0
+        self._latest_in_progress: list[AgentNode] = []
 
     def compose(self) -> ComposeResult:
         yield Static(id="top-strip")
@@ -198,13 +199,15 @@ class HoleInGolfDashboard(App[None]):
 
     def _refresh_dashboard(self) -> None:
         snapshot = self.provider.snapshot()
+        self._latest_in_progress = snapshot.in_progress
         self._render_header(snapshot)
         self._render_metrics(snapshot)
         self._render_merge_queue(snapshot)
         self._render_tree("#in-progress-tree", snapshot.in_progress)
         self._render_tree("#completed-tree", snapshot.completed)
         self._render_activity(snapshot.activity_lines)
-        self.query_one("#graph-panel", AgentGraphWidget).sync_agents(snapshot.in_progress)
+        for graph in self.query(AgentGraphWidget):
+            graph.sync_agents(snapshot.in_progress)
         self._render_bottom(snapshot)
 
     def _render_header(self, snapshot: DashboardSnapshot) -> None:
