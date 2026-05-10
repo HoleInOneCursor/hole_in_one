@@ -274,6 +274,54 @@ def poll_greptile_signal(
     return GreptileSignal(done=done, summary_parts=summary_parts, check_conclusion=check_conclusion)
 
 
+def fetch_latest_greptile_issue_comment_body(
+    client: httpx.Client,
+    repo: Repo,
+    pull_number: int,
+    *,
+    bot_substrings: list[str],
+    max_pages: int = 5,
+) -> str | None:
+    """Newest issue-comment body from a Greptile bot (by ``updated_at``).
+
+    GitHub in-place edits bump ``updated_at``, but polling with ``comments_since_iso`` can still
+    miss pairing that edit with the post-fix window — fall back to this to read the live summary.
+    """
+    best_dt: datetime | None = None
+    best_body: str | None = None
+    page = 1
+    while page <= max_pages:
+        r = client.get(
+            f"/repos/{repo.owner}/{repo.name}/issues/{pull_number}/comments",
+            params={"per_page": 100, "page": page},
+        )
+        r.raise_for_status()
+        batch: list[Any] = r.json()
+        if not batch:
+            break
+        for item in batch:
+            login = (item.get("user") or {}).get("login")
+            body = item.get("body")
+            if not isinstance(body, str) or not body.strip():
+                continue
+            if not _login_matches(login, bot_substrings):
+                continue
+            ts = item.get("updated_at") or item.get("created_at")
+            if not isinstance(ts, str):
+                continue
+            try:
+                cand = _parse_github_iso(ts)
+            except ValueError:
+                continue
+            if best_dt is None or cand >= best_dt:
+                best_dt = cand
+                best_body = body.strip()
+        if len(batch) < 100:
+            break
+        page += 1
+    return best_body
+
+
 _MERGE_METHOD_GRAPHQL = {"merge": "MERGE", "squash": "SQUASH", "rebase": "REBASE"}
 
 

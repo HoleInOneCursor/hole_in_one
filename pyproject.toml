@@ -11,9 +11,11 @@ dependencies = [
 ]
 
 [project.scripts]
-orchestrate = "hole_in_one.cli:main"
-hole-in-golf = "hole_in_one.cli:main"
+# Cursor + Greptile loop (--prompt, --continuous, etc.)
+orchestrate = "hole_in_one.orchestrate:main"
 orchestrate-loop = "hole_in_one.orchestrate:main"
+# Textual dashboard (optional positional: ui | backend)
+hole-in-golf = "hole_in_one.cli:main"
 
 [build-system]
 requires = ["setuptools>=61"]

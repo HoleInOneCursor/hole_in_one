@@ -49,6 +49,8 @@ cp .env.example .env
 
 orchestrate
 # or: python -m hole_in_one.orchestrate
+# or: orchestrate-loop  (same entrypoint as orchestrate)
+# Textual dashboard only: hole-in-golf   # default mode is ui (not the Cursor/Greptile CLI flags)
 
 # Builder task (overrides BUILDER_PROMPT in .env):
 orchestrate --prompt "Add a README section on agent ergonomics."

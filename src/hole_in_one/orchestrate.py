@@ -33,6 +33,7 @@ from hole_in_one.github_api import (
     branch_exists,
     create_pull_issue_comment,
     enable_pull_request_auto_merge,
+    fetch_latest_greptile_issue_comment_body,
     fetch_pull_request_patch_bundle,
     find_latest_open_pr_head_ref_prefix,
     find_open_pr_for_branch,
@@ -145,7 +146,12 @@ def _greptile_indicates_no_action_needed(text: str, *, extra_substrings: list[st
     for s in extra_substrings:
         if s and s.lower() in lower:
             return True
-    if re.search(r"\bsafe\s+to\s+merge\b", stripped, re.I):
+    # Avoid matching "Not safe to merge" (Greptile often uses both phrases).
+    if re.search(r"\bsafe\s+to\s+merge\b", stripped, re.I) and not re.search(
+        r"\bnot\s+safe\s+to\s+merge\b",
+        stripped,
+        re.I,
+    ):
         return True
     if re.search(r"\bno\s+(critical\s+)?issues\s+(were\s+)?found\b", stripped, re.I):
         return True
@@ -913,6 +919,50 @@ def main() -> None:
                         comments_since_iso=round_started_iso,
                     )
                     joined = "\n".join(after.summary_parts).strip()
+                    if not joined:
+                        latest_issue = fetch_latest_greptile_issue_comment_body(
+                            gh,
+                            repo,
+                            pull_number,
+                            bot_substrings=bot_substrings,
+                        )
+                        if latest_issue:
+                            joined = latest_issue
+                            print(
+                                "Recovered Greptile summary from latest issue comment "
+                                "(post-fix poll had no new-comment window match).",
+                                file=sys.stderr,
+                            )
+                            mirror_raw = os.environ.get(
+                                "GREPTILE_MIRROR_FALLBACK_COMMENT",
+                                "1",
+                            ).strip().lower()
+                            mirror_fallback = mirror_raw not in ("0", "false", "no")
+                            if mirror_fallback:
+                                cap = 62000
+                                snap = joined if len(joined) <= cap else joined[:cap] + "\n\n_(truncated)_"
+                                mirror_body = (
+                                    "**Greptile summary (orchestrate snapshot)** — posted because "
+                                    "Greptile often *edits* its summary in place; fresh timeline "
+                                    "comments surface the current text for bots and humans.\n\n"
+                                    + snap
+                                )
+                                try:
+                                    create_pull_issue_comment(
+                                        gh,
+                                        repo,
+                                        pull_number,
+                                        mirror_body,
+                                    )
+                                    print(
+                                        "Posted Greptile snapshot as a new PR issue comment.",
+                                        file=sys.stderr,
+                                    )
+                                except Exception as exc:
+                                    print(
+                                        f"Warning: could not post Greptile snapshot comment ({exc}).",
+                                        file=sys.stderr,
+                                    )
                     if _greptile_indicates_no_action_needed(
                         joined,
                         extra_substrings=greptile_clean_substrings,
@@ -926,6 +976,7 @@ def main() -> None:
                                 "Greptile check succeeded with no captured text after fix; "
                                 "stopping fix loop.",
                             )
+                            skipped_fix_loop_for_clean_greptile = True
                             break
                         print("No Greptile text after fix; stopping fix loop.")
                         break

@@ -1,6 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import sys
+
+# If argv looks like the Cursor/Greptile CLI, run orchestrate.main() (same process argv).
+_ORCHESTRATE_FLAGS = frozenset({
+    "--prompt",
+    "-p",
+    "--continuous",
+    "-i",
+    "--interactive-prompt",
+})
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -25,6 +35,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    argv = sys.argv[1:]
+
+    if _ORCHESTRATE_FLAGS.intersection(argv):
+        from hole_in_one.orchestrate import main as orchestrate_main
+
+        orchestrate_main()
+        return
+
+    # Common mistake: `hole-in-golf Change the app…` (sentence as first “mode”).
+    if argv and argv[0] not in ("ui", "backend") and not any(a.startswith("-") for a in argv):
+        from hole_in_one.orchestrate import main as orchestrate_main
+
+        sys.argv = [sys.argv[0], "--prompt", " ".join(argv)]
+        orchestrate_main()
+        return
+
     parser = build_parser()
     args = parser.parse_args()
     if args.mode == "backend":
