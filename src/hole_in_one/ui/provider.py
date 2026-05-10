@@ -86,7 +86,7 @@ class MockDashboardProvider:
             completed=[self._clone_node(node) for node in self._completed],
             activity_lines=list(self._activity),
             feature_progress=feature,
-            controls_hint="mock mode | tab=agent-grid/activity | q=quit",
+            controls_hint="mock mode | tab=agent-grid/activity/graph | q=quit",
         )
 
     def _tick(self) -> None:

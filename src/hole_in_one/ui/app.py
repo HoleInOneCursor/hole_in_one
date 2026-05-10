@@ -6,6 +6,7 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Footer, RichLog, Static, TabbedContent, TabPane, Tree
 
+from hole_in_one.ui.graph import AgentGraphWidget
 from hole_in_one.ui.models import AgentKind, AgentNode, AgentStatus, DashboardSnapshot
 from hole_in_one.ui.provider import DashboardDataProvider, MockDashboardProvider
 
@@ -107,6 +108,12 @@ class HoleInGolfDashboard(App[None]):
         margin-top: 1;
     }
 
+    #graph-panel {
+        border: round #6ea333;
+        height: 1fr;
+        padding: 0 1;
+    }
+
     #bottom-row {
         height: 3;
         margin: 0 1 1 1;
@@ -171,6 +178,11 @@ class HoleInGolfDashboard(App[None]):
                         timeline.border_title = "Timeline"
                         yield timeline
 
+                    with TabPane("Graph", id="graph-tab"):
+                        graph = AgentGraphWidget(id="graph-panel")
+                        graph.border_title = "Agent Flow Graph"
+                        yield graph
+
         with Horizontal(id="bottom-row"):
             yield Static(id="features-bar", classes="panel")
             yield Static(id="controls-bar", classes="panel")
@@ -192,6 +204,7 @@ class HoleInGolfDashboard(App[None]):
         self._render_tree("#in-progress-tree", snapshot.in_progress)
         self._render_tree("#completed-tree", snapshot.completed)
         self._render_activity(snapshot.activity_lines)
+        self.query_one("#graph-panel", AgentGraphWidget).sync_agents(snapshot.in_progress)
         self._render_bottom(snapshot)
 
     def _render_header(self, snapshot: DashboardSnapshot) -> None:

@@ -7,6 +7,7 @@ Stack: **Python**, **httpx**, **Textual**, and the [Cursor Cloud Agents HTTP API
 This repo now has a frontend-first terminal dashboard entrypoint:
 - Default CLI mode opens the TUI visualizer (`orchestrate` or `hole-in-golf`).
 - Backend orchestration loop is still available via explicit `backend` mode.
+- TUI tabs: `Agent Grid`, `Activity`, and live `Graph`.
 - Current dashboard is intentionally mock-data driven (no backend wiring yet) so integration is straightforward when APIs stabilize.
 
 ## What you demo
