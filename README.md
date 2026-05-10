@@ -1,8 +1,13 @@
-# Hole in One
+# Hole In Golf
 
 **Theme:** *Build Something Agents Want* — a minimal loop where **Cursor cloud agents** ship a PR, **Greptile** reviews it, and agents apply follow-up commits.
 
-Stack: **Python**, **httpx**, and the [Cursor Cloud Agents HTTP API](https://cursor.com/docs/cloud-agent/api/endpoints.md) (no TypeScript SDK). Scope is intentionally small: one PR loop you can extend.
+Stack: **Python**, **httpx**, **Textual**, and the [Cursor Cloud Agents HTTP API](https://cursor.com/docs/cloud-agent/api/endpoints.md) (no TypeScript SDK).
+
+This repo now has a frontend-first terminal dashboard entrypoint:
+- Default CLI mode opens the TUI visualizer (`orchestrate` or `hole-in-golf`).
+- Backend orchestration loop is still available via explicit `backend` mode.
+- Current dashboard is intentionally mock-data driven (no backend wiring yet) so integration is straightforward when APIs stabilize.
 
 ## What you demo
 
@@ -21,8 +26,13 @@ pip install -e .
 cp .env.example .env
 # fill CURSOR_API_KEY, GITHUB_TOKEN, GITHUB_REPO
 
+# open terminal dashboard (default mode)
 orchestrate
-# or: python -m hole_in_one.orchestrate
+# or: hole-in-golf
+
+# run legacy backend loop
+orchestrate backend
+# or: orchestrate-loop
 ```
 
 Prerequisites: Greptile GitHub app on the repo; Cursor Cloud connected to that repo; optional `triggerOnUpdates` in `greptile.json` so re-review runs after pushes.
@@ -36,4 +46,8 @@ Tune `GREPTILE_BOT_SUBSTRINGS` / `GREPTILE_CHECK_SUBSTRINGS` if your Greptile ap
 | `hole_in_one/cursor_api.py` | Cursor REST: create agent, runs, wait |
 | `hole_in_one/github_api.py` | Greptile heuristics via GitHub REST |
 | `hole_in_one/feedback.py` | Chunk markdown for parallel mode |
-| `hole_in_one/orchestrate.py` | CLI |
+| `hole_in_one/orchestrate.py` | Backend orchestration loop |
+| `hole_in_one/cli.py` | CLI entrypoint (`ui` default, `backend` optional) |
+| `hole_in_one/ui/models.py` | Dashboard view models |
+| `hole_in_one/ui/provider.py` | Provider interface + mock provider |
+| `hole_in_one/ui/app.py` | Textual terminal dashboard |
