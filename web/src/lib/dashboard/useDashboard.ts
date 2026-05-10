@@ -36,7 +36,8 @@ export function useDashboard(intervalMs: number = DEFAULT_INTERVAL_MS): Dashboar
         }
       } catch (error) {
         if (!cancelled) {
-          console.error("Dashboard snapshot fetch failed:", error);
+          const reason = error instanceof Error ? error.message : String(error);
+          console.info(`Dashboard snapshot fetch issue: ${reason}`);
           if (DASHBOARD_MODE === "live" && !gotLiveSnapshotRef.current) {
             if (localFallbackRef.current == null) {
               localFallbackRef.current = new MockDashboardProvider();
