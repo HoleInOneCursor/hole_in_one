@@ -4,14 +4,19 @@
 
 Stack: **Python**, **httpx**, **Next.js**, and the [Cursor Cloud Agents HTTP API](https://cursor.com/docs/cloud-agent/api/endpoints.md) (no TypeScript SDK). Scope is intentionally small: one PR loop you can extend; the web UI demos agent activity visually.
 
-This repo now has a frontend-first **web dashboard**:
+## Summary
 
-- Next.js app in `web/`
-- Tabs: `Agent Grid`, `Activity`, `Graph`
-- Graph is a browser-native animated node/edge visualization
-- Current web dashboard is intentionally mock-data driven (no backend wiring yet)
+**Hole In Golf** ships **`hole_in_one`**, a Python CLI that drives **Cursor cloud agents** on a GitHub repo: builders open PRs, **Greptile** reviews them, optional **fix rounds** spawn more agents on the same PR, and optional **[CLōD](https://clod.io/)** can summarize Greptile for fixes and run a **second validator** (PR body / comment). The **CLōD planner** (`--plan` or `CLOD_PLANNER=1`) turns one high-level goal into **ordered sequential builder tasks**. Merge behavior prefers GitHub **auto-merge** when it works; when GraphQL queueing fails (e.g. “clean status”), the CLI can **REST-merge** after Greptile + fixes + validator. Multi-task planner runs wait for each PR to merge before the next step by default (`CLOD_PLANNER_WAIT_MERGE_BETWEEN_TASKS`).
 
-A legacy Textual terminal dashboard still exists in the Python package, but the web UI is now the primary frontend.
+The **Next.js** app in `web/` is the primary dashboard: **Agent Grid**, **Activity**, **Graph**, plus **Builder Plan** (live steps from the orchestrator). Point it at `orchestrate`’s FastAPI bridge (`GET /api/dashboard/snapshot`) or use mock mode for UI-only demos. Styling is **Cursor-inspired** (dark zinc, violet accents, Inter + JetBrains Mono).
+
+**Web dashboard** (`web/`):
+
+- Tabs: **Agent Grid**, **Activity**, **Graph**; sidebar **Builder Plan** when the planner is active
+- **Live**: `NEXT_PUBLIC_DASHBOARD_MODE=live` + FastAPI snapshot API from `orchestrate` (defaults `http://127.0.0.1:8787`)
+- **Mock**: default mode for UI demos without the Python backend
+
+A legacy **Textual** terminal UI remains in the Python package.
 
 ## Quick start (web dashboard)
 
@@ -41,7 +46,7 @@ npm run dev
 5. **Continuous mode** (`CONTINUOUS_BUILDS=1` or `orchestrate --continuous`): after Greptile + fix rounds, wait until the PR **merges**, then start another builder on the same default branch so the repo keeps gaining small improvements.
 6. Exposes a FastAPI dashboard bridge at `GET /api/dashboard/snapshot` and `GET /api/dashboard/health` (default `http://127.0.0.1:8787`) so the Next.js dashboard can poll live orchestration state.
 
-Set **`GITHUB_AUTO_MERGE=merge`** (or `squash` / `rebase`) so each new PR **queues GitHub auto-merge** as soon as the CLI knows the PR number (merging still waits on your checks and branch protection). On GitHub: **Settings → General → Pull Requests → Allow auto-merge**. The PAT needs **Pull requests: Read and write** (fine-grained). When queueing **succeeds**, **`GITHUB_MERGE_ON_GREPTILE_CLEAN`** is skipped for that PR so GitHub merges alone—no redundant REST merge. If GraphQL queueing **fails** (common with insufficient PAT scopes) but Greptile looks **clean**, the CLI **REST-merges** using the same **`GITHUB_AUTO_MERGE`** method (`squash` / `merge` / `rebase`) so **`CONTINUOUS_BUILDS`** is not stuck waiting. If you see “Resource not accessible by personal access token”, expand PAT permissions, authorize SSO, or use **`GITHUB_MERGE_IMMEDIATE`** / **`GITHUB_MERGE_ON_GREPTILE_CLEAN`** instead.
+Set **`GITHUB_AUTO_MERGE=merge`** (or `squash` / `rebase`) so each new PR **queues GitHub auto-merge** as soon as the CLI knows the PR number (merging still waits on your checks and branch protection). On GitHub: **Settings → General → Pull Requests → Allow auto-merge**. The PAT needs **Pull requests: Read and write** (fine-grained). When queueing **succeeds**, **`GITHUB_MERGE_ON_GREPTILE_CLEAN`** is skipped for that PR so GitHub merges alone—no redundant REST merge. If GraphQL queueing **fails** (PAT issues, or GitHub’s *“Pull request is in clean status”* when there are no **required** checks to wait on), the CLI still **REST-merges** after Greptile + fix rounds + CLōD validator using the same **`GITHUB_AUTO_MERGE`** method—polls until **`mergeable_state=clean`**, so you are not stuck with only `GITHUB_MERGE_ON_GREPTILE_CLEAN` or a Greptile “skip fix loop” path. If you see “Resource not accessible by personal access token”, expand PAT permissions, authorize SSO, or use **`GITHUB_MERGE_IMMEDIATE`** / **`GITHUB_MERGE_ON_GREPTILE_CLEAN`** instead.
 
 If you cannot use GraphQL auto-merge, set **`GITHUB_MERGE_IMMEDIATE=squash`** (or `merge` / `rebase`): after Greptile + fix rounds, the CLI **polls until `mergeable_state=clean`**, then **`PUT .../pulls/{id}/merge`**. If **`GITHUB_AUTO_MERGE`** and **`GITHUB_MERGE_IMMEDIATE`** are both set, REST wins (GraphQL is skipped).
 
@@ -70,6 +75,8 @@ orchestrate -i   # type the task when prompted
 # CLOD_API_KEY=…   CLOD_PLANNER=1   orchestrate --prompt "Build a minimal full-stack …"
 # Or: orchestrate --prompt "…" --plan
 # Not compatible with --continuous / CONTINUOUS_BUILDS when multiple tasks are planned.
+# By default the CLI waits for each PR to merge before the next task (CLOD_PLANNER_WAIT_MERGE_BETWEEN_TASKS=1)
+# so the next builder runs on an updated default branch.
 
 # Keep shipping after each merge (set in .env or use flag):
 # CONTINUOUS_BUILDS=1

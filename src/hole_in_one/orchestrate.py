@@ -1365,16 +1365,19 @@ def main() -> None:
                         )
                     elif (
                         not rest_merge_method
-                        and skipped_fix_loop_for_clean_greptile
                         and graphql_auto_merge_failed
                         and github_auto_merge
                         and not github_merge_immediate
                     ):
+                        # GraphQL queue often fails with "clean status" (no required checks). Previously we only
+                        # REST-merged when Greptile skipped the fix loop; if fixes ran then exited early,
+                        # nothing merged. Always offer REST after the full pipeline when queue never enabled.
                         rest_merge_method = github_auto_merge
                         rest_merge_label = "GITHUB_AUTO_MERGE (REST fallback)"
                         print(
-                            "GraphQL auto-merge failed — merging via REST API using "
-                            f"{github_auto_merge!r} (same as GITHUB_AUTO_MERGE).",
+                            "GitHub auto-merge queue was not enabled — will merge via REST API after "
+                            "Greptile/fixes/validator using "
+                            f"{github_auto_merge!r} (polls until mergeable_state=clean).",
                             file=sys.stderr,
                         )
         
@@ -1401,8 +1404,49 @@ def main() -> None:
                             dashboard_store.mark_pr_merged(pull_number)
     
                     if not continuous:
+                        # Multi-task planner (--plan): next task must not start until this PR lands on the
+                        # default branch; otherwise builders stack on stale main and "auto-merge" looks broken.
+                        planner_wait_merge = os.environ.get(
+                            "CLOD_PLANNER_WAIT_MERGE_BETWEEN_TASKS", "1"
+                        ).strip().lower() not in ("0", "false", "no")
+                        if (
+                            planner_wait_merge
+                            and len(builder_prompts) > 1
+                            and _task_i < len(builder_prompts) - 1
+                        ):
+                            print(
+                                f"\nPlanner: waiting for PR #{pull_number} to merge before "
+                                f"task {_task_i + 2}/{len(builder_prompts)} "
+                                "(set CLOD_PLANNER_WAIT_MERGE_BETWEEN_TASKS=0 to skip)…",
+                                flush=True,
+                            )
+                            if dashboard_store is not None:
+                                dashboard_store.record_activity(
+                                    "merge",
+                                    f"waiting for PR #{pull_number} merge before next planner task",
+                                )
+                            merged_between = wait_pull_merged(
+                                gh,
+                                repo,
+                                pull_number,
+                                poll_interval_s=merge_poll_interval_s,
+                                budget_s=merge_poll_budget_s,
+                            )
+                            if not merged_between:
+                                print(
+                                    "Timed out waiting for merge between planner tasks. "
+                                    "Merge the PR on GitHub, raise GITHUB_MERGE_POLL_BUDGET_S, or set "
+                                    "CLOD_PLANNER_WAIT_MERGE_BETWEEN_TASKS=0.",
+                                    file=sys.stderr,
+                                )
+                                if dashboard_store is not None:
+                                    dashboard_store.mark_merge_conflict(
+                                        pull_number,
+                                        "timed out waiting for merge between planner tasks",
+                                    )
+                                sys.exit(1)
                         break
-        
+
                     print(
                         f"Waiting up to {continuous_merge_wait_s:.0f}s for PR #{pull_number} to merge…",
                     )
