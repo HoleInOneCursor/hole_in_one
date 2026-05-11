@@ -27,6 +27,7 @@ from hole_in_one.cursor_api import (
     CursorCloudError,
     create_agent,
     create_agent_on_pr,
+    get_run,
     get_agent,
     stop_agent,
     wait_for_terminal_run,
@@ -182,6 +183,25 @@ def _branch_name_from_cursor_agent(agent: dict[str, object]) -> str | None:
     return None
 
 
+def _pr_url_from_cursor_agent(agent: dict[str, object]) -> str | None:
+    v = agent.get("prUrl")
+    if isinstance(v, str) and v.strip():
+        return v.strip()
+    target = agent.get("target")
+    if isinstance(target, dict):
+        tv = target.get("prUrl")
+        if isinstance(tv, str) and tv.strip():
+            return tv.strip()
+    repos = agent.get("repos")
+    if isinstance(repos, list):
+        for entry in repos:
+            if isinstance(entry, dict):
+                pv = entry.get("prUrl")
+                if isinstance(pv, str) and pv.strip():
+                    return pv.strip()
+    return None
+
+
 def _env(name: str, default: str | None = None) -> str:
     v = os.environ.get(name, default)
     if v is None or v == "":
@@ -191,6 +211,10 @@ def _env(name: str, default: str | None = None) -> str:
 
 def _comma_list(name: str, default: str) -> list[str]:
     return [s.strip() for s in os.environ.get(name, default).split(",") if s.strip()]
+
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
 
 
 @dataclass(frozen=True)
@@ -296,6 +320,37 @@ def _wait_greptile(
     )
 
 
+def _wait_for_terminal_run_with_budget(
+    api_key: str,
+    agent_id: str,
+    run_id: str,
+    *,
+    max_runtime_s: float | None,
+    poll_s: float = 4.0,
+) -> tuple[dict[str, object], bool]:
+    """
+    Wait for run completion with optional hard runtime budget.
+    Returns (run_payload, timed_out).
+    """
+    if max_runtime_s is None or max_runtime_s <= 0:
+        run = wait_for_terminal_run(api_key, agent_id, run_id, poll_s=poll_s)
+        return run, False
+
+    deadline = time.monotonic() + max_runtime_s
+    terminal = {"FINISHED", "ERROR", "CANCELLED", "EXPIRED"}
+    last_run: dict[str, object] = {"status": "RUNNING"}
+    while True:
+        run = get_run(api_key, agent_id, run_id)
+        if isinstance(run, dict):
+            last_run = run
+            status = str(run.get("status") or "")
+            if status in terminal:
+                return run, False
+        if time.monotonic() >= deadline:
+            return last_run, True
+        time.sleep(max(0.5, poll_s))
+
+
 def _normalize_workstreams(items: list[str], *, max_items: int) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
@@ -313,10 +368,33 @@ def _normalize_workstreams(items: list[str], *, max_items: int) -> list[str]:
     return out
 
 
-def _heuristic_workstream_plan(task_prompt: str, *, max_items: int) -> list[str]:
+def _heuristic_workstream_plan(
+    task_prompt: str,
+    *,
+    max_items: int,
+    target_minutes: int,
+    speed_first: bool,
+) -> list[str]:
     cleaned = re.sub(r"\s+", " ", task_prompt).strip()
     if len(cleaned) > 220:
         cleaned = cleaned[:220].rstrip() + "…"
+    if speed_first:
+        parts = [
+            p.strip(" .")
+            for p in re.split(r"[,\n;]+", task_prompt)
+            if p.strip()
+        ]
+        micro: list[str] = []
+        for p in parts:
+            micro.append(
+                (
+                    f"Implement only this narrow slice: {p}. Keep it small enough to finish in about "
+                    f"{target_minutes} minutes; touch as few files as possible."
+                )
+            )
+        if micro:
+            return _normalize_workstreams(micro, max_items=max_items)
+
     candidates = [
         (
             f"Implement core logic and data flow for: {cleaned}. Keep the scope in backend/core "
@@ -338,6 +416,8 @@ def _plan_subagent_workstreams(
     task_prompt: str,
     *,
     max_items: int,
+    speed_first: bool,
+    target_minutes: int,
     clod_key: str,
     clod_base_url: str,
     clod_model: str,
@@ -350,8 +430,15 @@ def _plan_subagent_workstreams(
 
     if use_clod and clod_key:
         try:
+            planner_goal = task_prompt
+            if speed_first:
+                planner_goal = (
+                    task_prompt.strip()
+                    + "\n\nSpeed constraints: return micro-workstreams that each can be completed in about "
+                    + f"{target_minutes} minutes by one implementation agent, ideally touching only 1-2 files."
+                )
             planned = plan_pr_workstreams(
-                task_prompt,
+                planner_goal,
                 api_key=clod_key,
                 base_url=clod_base_url,
                 model=clod_model,
@@ -372,7 +459,12 @@ def _plan_subagent_workstreams(
                 file=sys.stderr,
             )
 
-    return _heuristic_workstream_plan(task_prompt, max_items=max_items)
+    return _heuristic_workstream_plan(
+        task_prompt,
+        max_items=max_items,
+        target_minutes=target_minutes,
+        speed_first=speed_first,
+    )
 
 
 def _run_workstream_subagents(
@@ -386,6 +478,9 @@ def _run_workstream_subagents(
     max_workers: int,
     model_id: str | None,
     stop_mode: str,
+    speed_first: bool,
+    target_minutes: int,
+    max_runtime_s: float | None,
     dashboard: DashboardStore | None = None,
 ) -> None:
     total = len(workstreams)
@@ -439,12 +534,21 @@ def _run_workstream_subagents(
         )
 
     def one(idx: int, workstream_task: str) -> None:
+        speed_lines = (
+            [
+                f"Speed is top priority: ship a minimal viable change in about {target_minutes} minutes.",
+                "Keep the diff tiny (prefer 1-2 files); skip polish and broad refactors.",
+            ]
+            if speed_first
+            else []
+        )
         prompt = "\n".join(
             [
                 f"You are subagent {idx + 1}/{total} on PR #{pull_number} ({pr_url}).",
                 "Only execute your assigned workstream; avoid unrelated refactors.",
                 "Push commits to the existing PR branch; do not open another PR.",
                 "Leave clear commit messages describing the slice you changed.",
+                *speed_lines,
                 "",
                 "Assigned workstream:",
                 workstream_task,
@@ -465,7 +569,22 @@ def _run_workstream_subagents(
         _mark_started(agent_id, idx, workstream_task)
 
         try:
-            run = wait_for_terminal_run(api_key, agent_id, run_id)
+            run, timed_out = _wait_for_terminal_run_with_budget(
+                api_key,
+                agent_id,
+                run_id,
+                max_runtime_s=max_runtime_s,
+            )
+            if timed_out:
+                _mark_finished(
+                    agent_id,
+                    idx,
+                    success=False,
+                    note=f"{agent_id} timed out workstream {idx + 1}/{total}",
+                )
+                raise RuntimeError(
+                    f"Workstream {idx + 1}/{total} timed out after {max_runtime_s:.0f}s for agent {agent_id}",
+                )
             if str(run.get("status") or "") != "FINISHED":
                 _mark_finished(
                     agent_id,
@@ -758,12 +877,38 @@ def main() -> None:
     max_feedback_chunks = int(os.environ.get("MAX_FEEDBACK_CHUNKS", "6"))
     fix_round_cooldown_s = float(os.environ.get("FIX_ROUND_COOLDOWN_S", "45"))
     stop_mode = os.environ.get("CURSOR_STOP_AGENT", "archive").strip()
+    speed_priority = _env_truthy("SPEED_PRIORITY")
+    skip_greptile_review = _env_truthy("SKIP_GREPTILE_REVIEW")
+    subagent_target_minutes = max(1, int(os.environ.get("SUBAGENT_TARGET_MINUTES", "2")))
+    subagent_max_runtime_s = float(
+        os.environ.get("SUBAGENT_MAX_RUNTIME_S", "120" if speed_priority else "0"),
+    )
+    if subagent_max_runtime_s <= 0:
+        subagent_max_runtime_s = 0.0
 
     bot_substrings = _comma_list("GREPTILE_BOT_SUBSTRINGS", "greptile")
     check_substrings = _comma_list("GREPTILE_CHECK_SUBSTRINGS", "greptile")
     greptile_clean_substrings = _comma_list("GREPTILE_CLEAN_SUBSTRINGS", "")
     explicit_branch = os.environ.get("GITHUB_DEFAULT_BRANCH", "").strip()
     model_id = os.environ.get("CURSOR_MODEL") or None
+    fast_model_id = os.environ.get("CURSOR_FAST_MODEL") or None
+    subagent_model_id = os.environ.get("CURSOR_SUBAGENT_MODEL") or None
+    builder_model_id = os.environ.get("CURSOR_BUILDER_MODEL") or None
+    implementation_model_id = os.environ.get("CURSOR_IMPLEMENTATION_MODEL") or None
+    fix_model_id = os.environ.get("CURSOR_FIX_MODEL") or None
+
+    if speed_priority and fast_model_id:
+        builder_model_id = builder_model_id or fast_model_id
+        implementation_model_id = implementation_model_id or fast_model_id
+        fix_model_id = fix_model_id or fast_model_id
+
+    if subagent_model_id:
+        implementation_model_id = implementation_model_id or subagent_model_id
+        fix_model_id = fix_model_id or subagent_model_id
+
+    builder_model_id = builder_model_id or model_id
+    implementation_model_id = implementation_model_id or model_id
+    fix_model_id = fix_model_id or model_id
 
     refs_first = os.environ.get("CURSOR_STARTING_REF_REFS_FIRST", "").strip().lower() in (
         "1",
@@ -811,9 +956,6 @@ def main() -> None:
     merge_poll_budget_s = float(os.environ.get("GITHUB_MERGE_POLL_BUDGET_S", "7200"))
     merge_poll_interval_s = float(os.environ.get("GITHUB_MERGE_POLL_INTERVAL_S", "15"))
 
-    def _env_truthy(name: str) -> bool:
-        return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
-
     dashboard_enabled = os.environ.get("DASHBOARD_API_ENABLED", "1").strip().lower() not in (
         "0",
         "false",
@@ -860,6 +1002,29 @@ def main() -> None:
     workstream_clod_timeout_s = float(os.environ.get("CLOD_WORKSTREAM_TIMEOUT_S", "90"))
     workstream_clod_max_completion_tokens = int(
         os.environ.get("CLOD_WORKSTREAM_MAX_COMPLETION_TOKENS", "1536"),
+    )
+
+    if speed_priority:
+        if "MAX_WORKSTREAM_SUBAGENTS" not in os.environ:
+            max_workstream_subagents = min(MAX_WORKSTREAM_SUBAGENTS_CAP, 8)
+        if "MAX_PARALLEL_WORKSTREAMS" not in os.environ:
+            max_parallel_workstreams = min(MAX_PARALLEL_WORKSTREAMS_CAP, max_workstream_subagents)
+        if "MAX_FIX_ROUNDS" not in os.environ:
+            max_fix_rounds = 1
+    agent_meta_poll_attempts = max(
+        1,
+        int(
+            os.environ.get(
+                "CURSOR_AGENT_META_POLL_ATTEMPTS",
+                "4" if speed_priority else "10",
+            ),
+        ),
+    )
+    agent_meta_poll_interval_s = float(
+        os.environ.get(
+            "CURSOR_AGENT_META_POLL_INTERVAL_S",
+            "1.0" if speed_priority else "3.0",
+        ),
     )
 
     clod_cfg: ClodCompressConfig | None = None
@@ -956,6 +1121,12 @@ def main() -> None:
             extra_banner.append("clod-pr-comment")
     if planner_enabled:
         extra_banner.append("clod-planner")
+    if speed_priority:
+        extra_banner.append(f"speed-priority={subagent_target_minutes}m")
+    if subagent_max_runtime_s > 0:
+        extra_banner.append(f"subagent-budget={int(subagent_max_runtime_s)}s")
+    if skip_greptile_review:
+        extra_banner.append("skip-greptile-review")
     if workstream_subagents_enabled and max_workstream_subagents > 0:
         extra_banner.append(
             f"workstreams={max_workstream_subagents} (parallel={max_parallel_workstreams})",
@@ -1049,6 +1220,12 @@ def main() -> None:
                 full_builder_prompt = (
                     builder_prompt + "\n\nOpen a normal (non-draft) PR with a clear title and description."
                 )
+                if speed_priority:
+                    full_builder_prompt += (
+                        "\n\nSpeed mode: prioritize opening the PR fast with a minimal working scaffold, "
+                        "then stop broad implementation. Keep the first commit small so downstream "
+                        "workstream subagents can continue immediately."
+                    )
                 cycle = 0
                 while True:
                     cycle += 1
@@ -1095,7 +1272,7 @@ def main() -> None:
                                 starting_ref=start_ref,
                                 auto_create_pr=True,
                                 skip_reviewer_request=True,
-                                model_id=model_id,
+                                model_id=builder_model_id,
                             )
                             break
                         except CursorCloudError as exc:
@@ -1160,18 +1337,32 @@ def main() -> None:
                     pull_number: int | None = None
                     try:
                         agent_meta = get_agent(api_key, builder_id)
+                        pr_url = _pr_url_from_cursor_agent(agent_meta)
+                        if pr_url:
+                            pull_number = pull_number_from_pr_url(pr_url)
                         branch_name = _branch_name_from_cursor_agent(agent_meta)
-                        if not branch_name:
-                            for attempt in range(10):
-                                time.sleep(3.0)
+                        if (not branch_name) and (not pr_url):
+                            for attempt in range(agent_meta_poll_attempts):
+                                time.sleep(agent_meta_poll_interval_s)
                                 agent_meta = get_agent(api_key, builder_id)
+                                pr_url = _pr_url_from_cursor_agent(agent_meta) or pr_url
+                                if pr_url:
+                                    pull_number = pull_number_from_pr_url(pr_url)
+                                    print(
+                                        f"Resolved PR URL from Cursor API (poll {attempt + 2}).",
+                                    )
+                                    break
                                 branch_name = _branch_name_from_cursor_agent(agent_meta)
                                 if branch_name:
-                                    print(f"Resolved branchName from Cursor API (poll {attempt + 2}).")
+                                    print(
+                                        f"Resolved branchName from Cursor API (poll {attempt + 2}).",
+                                    )
                                     break
         
                         pr_data = None
-                        if branch_name:
+                        if pull_number:
+                            pr_data = {"number": pull_number, "html_url": pr_url}
+                        elif branch_name:
                             pr_data = find_open_pr_for_branch(gh, repo, branch_name)
         
                         if not pr_data:
@@ -1228,6 +1419,8 @@ def main() -> None:
                         workstreams = _plan_subagent_workstreams(
                             builder_prompt,
                             max_items=max_workstream_subagents,
+                            speed_first=speed_priority,
+                            target_minutes=subagent_target_minutes,
                             clod_key=clod_key,
                             clod_base_url=clod_shared_base,
                             clod_model=clod_shared_model,
@@ -1255,8 +1448,11 @@ def main() -> None:
                                     pr_head_ref=pr_head_ref_for_fix,
                                     workstreams=workstreams,
                                     max_workers=max_parallel_workstreams,
-                                    model_id=model_id,
+                                    model_id=implementation_model_id,
                                     stop_mode=stop_mode,
+                                    speed_first=speed_priority,
+                                    target_minutes=subagent_target_minutes,
+                                    max_runtime_s=subagent_max_runtime_s,
                                     dashboard=dashboard_store,
                                 )
                                 _, pr_head_ref_for_fix = get_pr_head(gh, repo, pull_number)
@@ -1346,55 +1542,65 @@ def main() -> None:
                                     file=sys.stderr,
                                 )
         
-                    if dashboard_store is not None:
-                        dashboard_store.record_activity(
-                            "greptile",
-                            f"waiting for review signal on PR #{pull_number}",
-                        )
-                    gr = _wait_greptile(
-                        gh,
-                        repo,
-                        pull_number,
-                        bot_substrings=bot_substrings,
-                        check_substrings=check_substrings,
-                        poll_interval_s=poll_interval_s,
-                        poll_budget_s=poll_budget_s,
-                        continuous=continuous,
-                    )
-        
-                    if gr.clean_success_no_text:
-                        feedback_text = ""
-                        if dashboard_store is not None:
-                            dashboard_store.record_activity(
-                                "greptile",
-                                f"PR #{pull_number} check passed with no text",
-                            )
-                    elif gr.timed_out:
+                    feedback_text = ""
+                    skipped_fix_loop_for_clean_greptile = skip_greptile_review
+                    if skip_greptile_review:
                         print(
-                            "No Greptile feedback collected before timeout. "
-                            "Tune GREPTILE_* or comment @greptileai on the PR.",
+                            "SKIP_GREPTILE_REVIEW=1 — skipping Greptile wait and fix loop for speed.",
                         )
-                        print("PR:", pr_url)
-                        if dashboard_store is not None:
-                            dashboard_store.record_activity(
-                                "failed",
-                                f"Greptile timed out for PR #{pull_number}",
-                            )
-                        if continuous:
-                            break
-                        sys.exit(0)
-                    else:
-                        feedback_text = gr.text
                         if dashboard_store is not None:
                             dashboard_store.record_activity(
                                 "greptile",
-                                f"captured feedback for PR #{pull_number}",
+                                f"skipped review wait on PR #{pull_number}",
                             )
-        
-                    if feedback_text:
-                        print("--- Greptile feedback (truncated) ---\n", feedback_text[:4000])
-        
-                    skipped_fix_loop_for_clean_greptile = False
+                    else:
+                        if dashboard_store is not None:
+                            dashboard_store.record_activity(
+                                "greptile",
+                                f"waiting for review signal on PR #{pull_number}",
+                            )
+                        gr = _wait_greptile(
+                            gh,
+                            repo,
+                            pull_number,
+                            bot_substrings=bot_substrings,
+                            check_substrings=check_substrings,
+                            poll_interval_s=poll_interval_s,
+                            poll_budget_s=poll_budget_s,
+                            continuous=continuous,
+                        )
+            
+                        if gr.clean_success_no_text:
+                            feedback_text = ""
+                            if dashboard_store is not None:
+                                dashboard_store.record_activity(
+                                    "greptile",
+                                    f"PR #{pull_number} check passed with no text",
+                                )
+                        elif gr.timed_out:
+                            print(
+                                "No Greptile feedback collected before timeout. "
+                                "Tune GREPTILE_* or comment @greptileai on the PR.",
+                            )
+                            print("PR:", pr_url)
+                            if dashboard_store is not None:
+                                dashboard_store.record_activity(
+                                    "failed",
+                                    f"Greptile timed out for PR #{pull_number}",
+                                )
+                            if continuous:
+                                break
+                            sys.exit(0)
+                        else:
+                            feedback_text = gr.text
+                            if dashboard_store is not None:
+                                dashboard_store.record_activity(
+                                    "greptile",
+                                    f"captured feedback for PR #{pull_number}",
+                                )
+            
+                        if feedback_text:
+                            print("--- Greptile feedback (truncated) ---\n", feedback_text[:4000])
         
                     if max_fix_rounds <= 0:
                         print("MAX_FIX_ROUNDS=0 — skipping fix loop.")
@@ -1435,7 +1641,7 @@ def main() -> None:
                                     pull_number=pull_number,
                                     pr_head_ref=pr_head_ref_for_fix,
                                     feedback_text=fix_prompt_feedback,
-                                    model_id=model_id,
+                                    model_id=fix_model_id,
                                     stop_mode=stop_mode,
                                     dashboard=dashboard_store,
                                 )
@@ -1448,7 +1654,7 @@ def main() -> None:
                                     pr_head_ref=pr_head_ref_for_fix,
                                     chunks=chunks,
                                     max_workers=max_parallel_fixers,
-                                    model_id=model_id,
+                                    model_id=fix_model_id,
                                     stop_mode=stop_mode,
                                     dashboard=dashboard_store,
                                 )
@@ -1566,7 +1772,9 @@ def main() -> None:
                     if dashboard_store is not None:
                         dashboard_store.record_activity("pr", f"cycle done for PR #{pull_number}")
         
-                    if clod_validator_enabled:
+                    if clod_validator_enabled and skip_greptile_review:
+                        print("Skipping CLōD second validator because SKIP_GREPTILE_REVIEW=1.")
+                    if clod_validator_enabled and not skip_greptile_review:
                         print("\n=== CLōD second validator ===")
                         verdict = "UNKNOWN"
                         vbody = ""

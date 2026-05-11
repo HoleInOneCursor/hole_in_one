@@ -37,7 +37,7 @@ npm run dev
 1. A **builder** cloud agent opens a PR on `GITHUB_REPO` (`POST /v1/agents` with `autoCreatePR`).
 2. The builder is **stopped** (`CURSOR_STOP_AGENT`, default `archive`) once the PR is resolved.
 3. Optional workstream decomposition breaks the builder task into smaller slices and spawns **implementation subagents** on that same PR branch (`WORKSTREAM_SUBAGENTS_ENABLED=1`).
-4. Greptile reviews the PR; this CLI polls GitHub for checks/comments.
+4. Greptile reviews the PR; this CLI polls GitHub for checks/comments. Subagents run **before** Greptile and do not need Greptile approval to start.
 5. Each fix round starts a **new** cloud agent scoped to that PR (`repos[0].prUrl`), then stops it when the run finishes. Use `MAX_PARALLEL_FIXERS>1` only if you accept possible branch contention (cap is 10).
 6. **Continuous mode** (`CONTINUOUS_BUILDS=1` or `orchestrate --continuous`): after Greptile + fix rounds, wait until the PR **merges**, then start another builder on the same default branch so the repo keeps gaining small improvements.
 7. Exposes a FastAPI dashboard bridge at `GET /api/dashboard/snapshot` and `GET /api/dashboard/health` (default `http://127.0.0.1:8787`) so the Next.js dashboard can poll live orchestration state, including child subagents in tree/graph views.
@@ -88,6 +88,7 @@ If **`GITHUB_DEFAULT_BRANCH`** is unset, the CLI loads the repo’s **GitHub def
 
 Tune `GREPTILE_BOT_SUBSTRINGS` / `GREPTILE_CHECK_SUBSTRINGS` if your Greptile app uses different logins or check titles.
 Tune `MAX_WORKSTREAM_SUBAGENTS` / `MAX_PARALLEL_WORKSTREAMS` to control how aggressively builder tasks are split into implementation subagents before Greptile runs.
+For speed-first runs, use `SPEED_PRIORITY=1`, `SUBAGENT_TARGET_MINUTES=2`, `SUBAGENT_MAX_RUNTIME_S=120`, and optionally `SKIP_GREPTILE_REVIEW=1` (fastest but lowest safety).
 
 ## Layout
 
