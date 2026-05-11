@@ -347,7 +347,8 @@ export function ForceGraph({ roots, onNodeHover, onNodeLeave }: ForceGraphProps)
 
         {renderData.nodes.map((node) => {
           const color = STATUS_COLORS[node.status];
-          const labelVisible = node.kind === "builder" || node.childCount > 0;
+          const labelVisible =
+            node.kind === "builder" || node.kind === "implementation" || node.childCount > 0;
           const hoverPayload: AgentHoverDetails = {
             id: node.id,
             role: node.role,
@@ -376,6 +377,20 @@ export function ForceGraph({ roots, onNodeHover, onNodeLeave }: ForceGraphProps)
                   fillOpacity={0.92}
                   stroke={color}
                   strokeWidth={1.5}
+                  filter="url(#nodeGlow)"
+                />
+              ) : node.kind === "implementation" ? (
+                <rect
+                  x={node.x - node.radius}
+                  y={node.y - node.radius}
+                  width={node.radius * 2}
+                  height={node.radius * 2}
+                  rx={2}
+                  ry={2}
+                  fill={color}
+                  fillOpacity={0.88}
+                  stroke={color}
+                  strokeWidth={1.4}
                   filter="url(#nodeGlow)"
                 />
               ) : (

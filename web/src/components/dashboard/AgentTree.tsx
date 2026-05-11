@@ -46,8 +46,14 @@ function toRows(nodes: AgentNode[]): TreeRow[] {
 
 function kindGlyph(kind: AgentNode["kind"]): string {
   if (kind === "fix") return "▲";
-  if (kind === "builder") return "⬤";
+  if (kind === "builder") return "◉";
   return "●";
+}
+
+function kindLabel(kind: AgentNode["kind"]): string {
+  if (kind === "builder") return "planner";
+  if (kind === "fix") return "fixer";
+  return "worker";
 }
 
 export function AgentTree({ title, nodes, onNodeHover, onNodeLeave }: AgentTreeProps) {
@@ -80,7 +86,7 @@ export function AgentTree({ title, nodes, onNodeHover, onNodeLeave }: AgentTreeP
               <span className="agent-meta"> {node.progress}%</span>
               <span className="agent-meta"> • </span>
               <span style={{ color: KIND_COLORS[node.kind] }}>
-                {kindGlyph(node.kind)} {node.kind}
+                {kindGlyph(node.kind)} {kindLabel(node.kind)}
               </span>
             </div>
           );

@@ -878,6 +878,7 @@ def main() -> None:
     fix_round_cooldown_s = float(os.environ.get("FIX_ROUND_COOLDOWN_S", "45"))
     stop_mode = os.environ.get("CURSOR_STOP_AGENT", "archive").strip()
     speed_priority = _env_truthy("SPEED_PRIORITY")
+    builder_scout_only = _env_truthy("BUILDER_SCOUT_ONLY") or speed_priority
     skip_greptile_review = _env_truthy("SKIP_GREPTILE_REVIEW")
     subagent_target_minutes = max(1, int(os.environ.get("SUBAGENT_TARGET_MINUTES", "2")))
     subagent_max_runtime_s = float(
@@ -1011,6 +1012,8 @@ def main() -> None:
             max_parallel_workstreams = min(MAX_PARALLEL_WORKSTREAMS_CAP, max_workstream_subagents)
         if "MAX_FIX_ROUNDS" not in os.environ:
             max_fix_rounds = 1
+        if "CLOD_WORKSTREAM_PLANNER" not in os.environ:
+            workstream_use_clod_planner = False
     agent_meta_poll_attempts = max(
         1,
         int(
@@ -1123,6 +1126,8 @@ def main() -> None:
         extra_banner.append("clod-planner")
     if speed_priority:
         extra_banner.append(f"speed-priority={subagent_target_minutes}m")
+    if builder_scout_only:
+        extra_banner.append("builder-scout-only")
     if subagent_max_runtime_s > 0:
         extra_banner.append(f"subagent-budget={int(subagent_max_runtime_s)}s")
     if skip_greptile_review:
@@ -1225,6 +1230,15 @@ def main() -> None:
                         "\n\nSpeed mode: prioritize opening the PR fast with a minimal working scaffold, "
                         "then stop broad implementation. Keep the first commit small so downstream "
                         "workstream subagents can continue immediately."
+                    )
+                if builder_scout_only:
+                    full_builder_prompt += (
+                        "\n\nBuilder scope restriction (important):\n"
+                        "- Do NOT one-shot the full feature implementation.\n"
+                        "- Do only minimal scaffold/setup/interface work needed to unblock parallel "
+                        "implementation subagents.\n"
+                        "- Prefer 1-3 focused commits and open the PR as soon as the scaffold exists.\n"
+                        "- Leave clear TODO notes/checklist in the PR description or README for remaining slices."
                     )
                 cycle = 0
                 while True:

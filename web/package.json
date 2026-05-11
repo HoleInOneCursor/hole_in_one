@@ -4,6 +4,8 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "dev:mock": "NEXT_PUBLIC_DASHBOARD_MODE=mock next dev",
+    "dev:live": "NEXT_PUBLIC_DASHBOARD_MODE=live NEXT_PUBLIC_DASHBOARD_API_BASE=http://localhost:8787 next dev",
     "build": "next build",
     "start": "next start",
     "lint": "eslint"

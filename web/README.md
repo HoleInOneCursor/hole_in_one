@@ -12,6 +12,21 @@ npm run dev
 
 Open `http://localhost:3000`.
 
+## Run mock mode (no backend required)
+
+Mock mode is the default when `NEXT_PUBLIC_DASHBOARD_MODE` is unset, but you can force it:
+
+```bash
+cd web
+npm run dev:mock
+```
+
+You can also set this in `web/.env.local`:
+
+```bash
+NEXT_PUBLIC_DASHBOARD_MODE=mock
+```
+
 ## Live backend mode (FastAPI)
 
 Next.js **does not** load the repo-root `.env`. Put `NEXT_PUBLIC_*` in **`web/.env.local`** (see `.env.example` in repo root for values), or export them in the shell:
@@ -20,6 +35,13 @@ Next.js **does not** load the repo-root `.env`. Put `NEXT_PUBLIC_*` in **`web/.e
 NEXT_PUBLIC_DASHBOARD_MODE=live \
 NEXT_PUBLIC_DASHBOARD_API_BASE=http://localhost:8787 \
 npm run dev
+```
+
+Or use:
+
+```bash
+cd web
+npm run dev:live
 ```
 
 Restart `npm run dev` after changing env files.

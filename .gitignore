@@ -9,3 +9,4 @@ __pycache__/
 .env
 *.log
 .DS_Store
+.dev.env

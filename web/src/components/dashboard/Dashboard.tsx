@@ -76,6 +76,8 @@ export function Dashboard() {
   }
 
   const allWorking = flattenNodes(snapshot.inProgress);
+  const graphRoots = snapshot.inProgress.length > 0 ? snapshot.inProgress : snapshot.completed;
+  const allGraphed = flattenNodes(graphRoots);
 
   return (
     <main className="dashboard-shell">
@@ -246,18 +248,24 @@ export function Dashboard() {
             <section className="panel panel-secondary graph-panel">
               <h3 className="panel-title">Agent Flow Graph</h3>
               <ForceGraph
-                roots={snapshot.inProgress}
+                roots={graphRoots}
                 onNodeHover={(node, point) => setHoverCard({ node, x: point.x, y: point.y })}
                 onNodeLeave={() => setHoverCard(null)}
               />
               <div className="graph-legend">
                 <span>
-                  <strong>Shapes:</strong> builder circle, implementation circle, fix triangle
+                  <strong>Shapes:</strong> builder circle, implementation square, fix triangle
                 </span>
                 <span>
                   <strong>Status:</strong> sky=running, violet=complete, red=failed, amber=pending
                 </span>
-                <span>{allWorking.length} working agents visualized</span>
+                <span>
+                  {snapshot.inProgress.length > 0
+                    ? `${allWorking.length} working agents visualized`
+                    : snapshot.completed.length > 0
+                      ? `${allGraphed.length} completed agents visualized`
+                      : "no agents to visualize"}
+                </span>
               </div>
             </section>
           ) : null}
